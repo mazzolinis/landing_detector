@@ -1,4 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Permesso di usare la camera. Il plugin "camera" lo dichiara già nel suo manifest
+         (Gradle unisce i manifest), qui lo ripetiamo per renderlo esplicito.
+         Dichiararlo non basta: l'utente lo deve concedere a runtime (finestra di Android). -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
     <application
         android:label="landing_detector"
         android:name="${applicationName}"

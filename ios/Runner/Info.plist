@@ -6,6 +6,9 @@
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<!-- iOS: testo mostrato all'utente quando l'app chiede il permesso camera (obbligatorio). -->
+	<key>NSCameraUsageDescription</key>
+	<string>La camera serve a riprendere il campo per rilevare il fallo di landing.</string>
 	<key>CFBundleDisplayName</key>
 	<string>Landing Detector</string>
 	<key>CFBundleExecutable</key>

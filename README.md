@@ -11,8 +11,8 @@ three classes: ball carrier, ball, and forbidden area. Inference runs entirely o
 
 The project is under active development. Planned milestones:
 
-- [ ] Sound playback triggered by a button
-- [ ] Camera preview
+- [x] Sound playback triggered by a button
+- [x] Camera preview (rear camera, 720p, released and reopened when the app goes to background)
 - [ ] Model inference on camera frames
 - [ ] Fault logic (mask overlap and rolling score) with audible alert
 - [ ] Test mode on pre-recorded videos
@@ -22,6 +22,9 @@ The project is under active development. Planned milestones:
 - Flutter SDK (stable channel)
 - Android SDK (installed through Android Studio)
 - An Android device with USB debugging enabled
+
+On first launch the app asks for camera permission. If it is denied, enable it from
+Settings → Apps → landing_detector → Permissions.
 
 ## Getting Started
 
