@@ -1,4 +1,4 @@
-// Test minimo: verifica che la schermata mostri il pulsante e il contatore a zero.
+// Test minimo dell'interfaccia: la schermata mostra il pulsante e i contatori a zero.
 // (Non premiamo il pulsante: nei test non c'è un lettore audio nativo.)
 
 import 'package:flutter_test/flutter_test.dart';
@@ -6,10 +6,10 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:landing_detector/main.dart';
 
 void main() {
-  testWidgets('Mostra pulsante e contatore', (WidgetTester tester) async {
+  testWidgets('Mostra pulsante e contatori', (WidgetTester tester) async {
     await tester.pumpWidget(const LandingApp());
 
     expect(find.text('LANDING!'), findsOneWidget);
-    expect(find.text('Allarmi suonati: 0'), findsOneWidget);
+    expect(find.text('Allarmi automatici: 0   manuali: 0'), findsOneWidget);
   });
 }

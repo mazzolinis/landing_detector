@@ -61,6 +61,7 @@ test_videos/
 
 # YOLO artifacts
 *.pt
+*.tflite
 runs/
 datasets/
 
