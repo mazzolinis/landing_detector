@@ -130,8 +130,8 @@ class YOLOStreamingConfig {
   final Size? analysisResolution;
 
   /// [landing_detector] Names of the classes whose instance masks are built and streamed
-  /// (null = all classes). Masks of the other classes are not computed at all, which saves
-  /// ~10-20 ms per detection and frame. Only meaningful with [includeMasks].
+  /// (null = all classes). Masks of the other classes are not computed at all, which saved
+  /// ~20 ms per detection and frame in the original code, ~1-2 ms now. Only meaningful with [includeMasks].
   final List<String>? maskClasses;
 
   /// Creates a YOLOStreamingConfig with custom settings.

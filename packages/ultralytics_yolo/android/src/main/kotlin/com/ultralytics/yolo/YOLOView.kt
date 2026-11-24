@@ -1422,7 +1422,7 @@ class YOLOView @JvmOverloads constructor(
             imageProxy.close()
             return
         }
-        // [landing_detector] Frequency check BEFORE the (costly) YUV→bitmap conversion: the original code
+        // [landing_detector] Frequency check BEFORE the YUV→bitmap conversion (~1 ms): the original code
         // converted every camera frame (~30/s) and only then discarded the ones it did not analyse.
         // Not while scanning a QR code (that path needs every bitmap).
         val skipThisFrame = synchronized(qrReader) { qrCompletion == null } && predictor != null && !shouldRunInference()

@@ -148,8 +148,8 @@ const int kScoreThreshold = 3;
 /// molto tempo per tornare a 0 e riarmare l'allarme.
 const int kScoreMax = 5;
 
-/// Classi di cui il plugin costruisce e invia la maschera. Ogni maschera 160x120 costa
-/// ~10–20 ms per frame (costruzione, conversione, invio a Dart), quindi si chiedono solo quelle
+/// Classi di cui il plugin costruisce e invia la maschera. Ogni maschera 160x120 costava ~20 ms
+/// per frame; dopo le modifiche al plugin ~1–2 ms (speed_3), ma si chiedono comunque solo quelle
 /// che servono: i portatori sempre, forbidden_area solo durante la calibrazione (a zona attiva la
 /// zona è un riferimento fisso). ball non serve mai alla logica: arriva solo il box.
 /// (maskClasses è un parametro aggiunto da noi al plugin, vedi packages/ultralytics_yolo.)
@@ -716,15 +716,11 @@ class LandingLogic {
 /// è scalata finché copre tutto lo schermo e i bordi in eccesso sono tagliati). Usiamo la
 /// stessa formula del plugin: scala = max(W/w, H/h), immagine centrata. Solo camera posteriore
 /// (con quella frontale l'immagine sarebbe specchiata).
-///
-/// [showDetails] = occhio acceso: zona attiva, portatore e piedi. Con l'occhio spento si
-/// disegna solo la zona in calibrazione/proposta (serve per confermarla).
 class LogicOverlayPainter extends CustomPainter {
   final LandingLogic logic;
   final FrameReport? report;
-  final bool showDetails;
 
-  LogicOverlayPainter(this.logic, this.report, {this.showDetails = true});
+  LogicOverlayPainter(this.logic, this.report);
 
   static final Paint _zoneActivePaint = Paint()..color = Colors.orange.withValues(alpha: 0.35);
   static final Paint _zoneCalibPaint = Paint()..color = Colors.yellow.withValues(alpha: 0.25);
@@ -774,14 +770,12 @@ class LogicOverlayPainter extends CustomPainter {
       ZoneState.proposal => _zoneProposalPaint,
       _ => _zoneCalibPaint, // "_" = tutti gli altri casi, come default: in uno switch C++
     };
-    if (showDetails || logic.zoneState != ZoneState.active) {
-      for (var y = 0; y < gh; y++) {
-        drawRuns(y, (x) => logic.isDisplayZoneCell(x, y), zonePaint);
-      }
+    for (var y = 0; y < gh; y++) {
+      drawRuns(y, (x) => logic.isDisplayZoneCell(x, y), zonePaint);
     }
 
     // 2. Portatore: corpo bianco; se è a terra, fascia dei piedi rossa (nella zona) o azzurra.
-    if (!showDetails || !hasMask) return;
+    if (!hasMask) return;
     final feetTop = report!.feetTop;
     for (var y = 0; y < gh; y++) {
       final row = mask[y];
@@ -862,11 +856,10 @@ class _DetectionPageState extends State<DetectionPage> {
   int _manualAlarms = 0; // pressioni del pulsante (per segnare i landing nei test)
 
   // --- Overlay (icona a forma di occhio) ---
-  // false = schermo pulito: solo la zona in calibrazione/proposta (va confermata).
-  // true = tutto: box, confidenze e maschere grezzi del plugin (cosa vede la rete) + il nostro
-  // overlay (zona attiva, portatore, piedi: cosa usa la logica).
-  // Spento è anche più leggero: il plugin non dipinge la sua immagine delle maschere.
-  bool _showOverlays = false;
+  // Il nostro overlay (zona, portatore, piedi: cosa usa la logica) si vede sempre.
+  // true = in più box, confidenze e maschere grezzi disegnati dal plugin (cosa vede la rete).
+  // La differenza di velocità è trascurabile: ~1-2 ms per frame (speed_3).
+  bool _showRaw = false;
 
   @override
   void initState() {
@@ -874,7 +867,7 @@ class _DetectionPageState extends State<DetectionPage> {
     // Tiene lo schermo acceso: senza, Android lo spegne, l'app va in pausa e la camera si chiude.
     WakelockPlus.enable();
     // Il controller ricorda l'impostazione anche se la vista nativa non è ancora pronta.
-    _controller.setShowOverlays(_showOverlays);
+    _controller.setShowOverlays(_showRaw);
 
     _startSensors();
   }
@@ -923,9 +916,10 @@ class _DetectionPageState extends State<DetectionPage> {
     setState(() => _logic.startCalibration());
   }
 
-  void _toggleOverlays() {
-    setState(() => _showOverlays = !_showOverlays);
-    _controller.setShowOverlays(_showOverlays);
+  void _toggleRaw() {
+    setState(() => _showRaw = !_showRaw);
+    debugPrint('*** OCCHIO ${_showRaw ? 'ACCESO' : 'SPENTO'} ***'); // per confrontare i tempi nel log
+    _controller.setShowOverlays(_showRaw);
   }
 
   /// Pulsante "Ricalibra zona": da premere quando il telefono è stato spostato
@@ -1077,9 +1071,9 @@ class _DetectionPageState extends State<DetectionPage> {
         // "actions": pulsanti a destra nella barra in alto.
         actions: [
           IconButton(
-            tooltip: _showOverlays ? 'Nascondi sovrapposizioni' : 'Mostra tutte le sovrapposizioni',
-            icon: Icon(_showOverlays ? Icons.visibility : Icons.visibility_off),
-            onPressed: _toggleOverlays,
+            tooltip: _showRaw ? 'Nascondi rilevamenti grezzi' : 'Mostra rilevamenti grezzi',
+            icon: Icon(_showRaw ? Icons.visibility : Icons.visibility_off),
+            onPressed: _toggleRaw,
           ),
           IconButton(
             tooltip: 'Ricalibra zona',
@@ -1090,7 +1084,7 @@ class _DetectionPageState extends State<DetectionPage> {
       ),
       body: Stack(
         children: [
-          // Livello 1: camera + rete (se _showOverlays, il plugin disegna anche box e maschere grezzi).
+          // Livello 1: camera + rete (se _showRaw, il plugin disegna anche box e maschere grezzi).
           YOLOView(
             modelPath: kModelPath,
             task: YOLOTask.segment,
@@ -1106,7 +1100,7 @@ class _DetectionPageState extends State<DetectionPage> {
           // IgnorePointer: i tocchi passano attraverso e arrivano alla camera (tap per mettere a fuoco).
           Positioned.fill(
             child: IgnorePointer(
-              child: CustomPaint(painter: LogicOverlayPainter(_logic, report, showDetails: _showOverlays)),
+              child: CustomPaint(painter: LogicOverlayPainter(_logic, report)),
             ),
           ),
 
@@ -1148,10 +1142,9 @@ class _DetectionPageState extends State<DetectionPage> {
                       Text('punteggio: ${report.score}   (allarme a $kScoreThreshold)',
                           style: whiteText.copyWith(fontSize: 20, fontWeight: FontWeight.bold)),
                     ],
-                    if (_showOverlays)
-                      const Text('zona: gialla = calibrazione/proposta, arancio = attiva · '
-                          'bianco = portatore · piedi: rosso = nella zona, azzurro = fuori',
-                          style: TextStyle(color: Colors.white70, fontSize: 11)),
+                    const Text('zona: gialla = calibrazione/proposta, arancio = attiva · '
+                        'bianco = portatore · piedi: rosso = nella zona, azzurro = fuori',
+                        style: TextStyle(color: Colors.white70, fontSize: 11)),
                   ],
                 ],
               ),

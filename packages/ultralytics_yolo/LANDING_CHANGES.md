@@ -17,12 +17,13 @@ Every change is marked with a `[landing_detector]` comment in the sources.
      `BasePredictor.maskClasses`, applied in `Segmenter.generateCombinedMaskImage`; empty masks are
      skipped in `YOLOView.convertResultToStreamData`.
    - Reason: each 160x120 mask is converted to nested lists of boxed doubles and serialized value
-     by value, which costs about 10-20 ms per detection and frame (`data_logs/speed_1.txt`).
+     by value, which cost about 20 ms per detection and frame in the original code
+     (`data_logs/speed_1.txt`). With changes 3-5 a mask costs about 1-2 ms (`data_logs/speed_3.txt`).
 
 2. **Frequency check before the bitmap conversion** (`YOLOView.onFrame`): the original code
    converted every camera frame (about 30 per second) from YUV to a bitmap and only then discarded
    the frames it did not analyse. Now `shouldRunInference()` runs first (except while scanning a
-   QR code).
+   QR code). Measured afterwards: the conversion takes only about 1 ms, so the saving is small.
 
 3. **Non-blocking hand-off to the main thread** (`YOLOPlatformView.sendStreamData`): the original
    code posted the results to the main thread and then waited (`CountDownLatch`, up to 100 ms) for
