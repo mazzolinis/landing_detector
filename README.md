@@ -10,8 +10,9 @@ four classes: `ball`, `carrier_ground` (ball carrier with at least one foot on t
 device.
 
 A frame counts as a landing when the **feet** (bottom part of the mask) of a `carrier_ground`
-overlap the forbidden area. The area is kept in a per-cell low-pass filtered memory, so short
-detection gaps do not matter. A rolling score (+1 landing frame, −1 otherwise) triggers the
+overlap the forbidden area. The area is a fixed reference: at startup (and on demand) the app
+calibrates it for 3 s, taking the per-cell median of the network's `forbidden_area` masks, and
+the user confirms it. After that the network no longer changes it. A rolling score (+1 landing frame, −1 otherwise) triggers the
 alarm when it reaches the threshold.
 
 ## Project Status
@@ -47,12 +48,15 @@ The model file is **not included** in this repository. Export it from the traine
 yolo export model=best.pt format=litert nms=None imgsz=640   # ultralytics>=8.4.188
 ```
 
-Copy the resulting `.tflite` file into `assets/models/` as `landing_<imgsz>.tflite` and set
-`kModelSize` in `lib/main.dart` accordingly.
+Copy the resulting `.tflite` file into `assets/models/` following the naming convention
+`landing_<arch><imgsz>_v<version>.tflite` (for example `landing_n640_v2.tflite` for a
+YOLO26n-seg model exported at 640), then set `kModelName` (file name without extension) and
+`kModelSize` (the export `imgsz`) in `lib/main.dart`.
 
 The plugin copies the model into the app storage on first launch and reuses that copy as
-long as the file name does not change: give every new model a new name (for example
-`landing_640_v2.tflite`, updating `kModelPath`) or clear the app data on the phone.
+long as the file name does not change, so every new model needs a new file name. Older
+versions can stay in `assets/models/` as a fallback, but every file there is bundled into
+the APK: keep only the active model and one backup.
 
 ## License
 

@@ -38,6 +38,7 @@ dependencies:
   audioplayers: ^6.8.1
   ultralytics_yolo: ^0.7.2
   wakelock_plus: ^1.8.2
+  sensors_plus: ^7.1.1
 
 dev_dependencies:
   flutter_test:
