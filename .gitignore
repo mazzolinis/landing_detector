@@ -68,3 +68,6 @@ datasets/
 # Python scripts 
 .venv/
 __pycache__/
+
+# Native build cache of the local plugin copy (CMake)
+.cxx/

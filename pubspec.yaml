@@ -36,7 +36,10 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
   audioplayers: ^6.8.1
-  ultralytics_yolo: ^0.7.2
+  # Copia locale (modificata) del plugin ultralytics_yolo 0.7.2, in packages/ultralytics_yolo.
+  # Le modifiche sono marcate "[landing_detector]" nei sorgenti (vedi packages/ultralytics_yolo/LANDING_CHANGES.md).
+  ultralytics_yolo:
+    path: packages/ultralytics_yolo
   wakelock_plus: ^1.8.2
   sensors_plus: ^7.1.1
 

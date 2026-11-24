@@ -58,6 +58,12 @@ long as the file name does not change, so every new model needs a new file name.
 versions can stay in `assets/models/` as a fallback, but every file there is bundled into
 the APK: keep only the active model and one backup.
 
+## Local plugin copy
+
+`packages/ultralytics_yolo` is a modified copy of the `ultralytics_yolo` 0.7.2 plugin, used as a
+path dependency. The changes (mask class filter, frame-skipping before the bitmap conversion,
+timing logs) are listed in `packages/ultralytics_yolo/LANDING_CHANGES.md`.
+
 ## License
 
 This project is intended for personal use. The `ultralytics_yolo` plugin and the

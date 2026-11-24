@@ -466,7 +466,10 @@ void main() {
       (LandingLogic(), null),
     ];
     for (final (logic, report) in cases) {
-      LogicOverlayPainter(logic, report).paint(Canvas(PictureRecorder()), const Size(400, 800));
+      for (final details in [true, false]) {
+        LogicOverlayPainter(logic, report, showDetails: details)
+            .paint(Canvas(PictureRecorder()), const Size(400, 800));
+      }
     }
   });
 }

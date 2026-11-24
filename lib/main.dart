@@ -67,11 +67,13 @@ const Size kAnalysisResolution = Size(kModelSize * 1.0, kModelSize * 0.75);
 
 /// Frequenza di analisi variabile (inferenze al secondo):
 /// - "riposo": nessun portatore di palla in vista → si analizza poco, il telefono si scalda meno;
-/// - "azione": c'è un portatore → si analizza il più spesso possibile.
-///   kActiveHz è solo un TETTO: la rete non supera comunque ~11 analisi/s; mettendolo più
-///   alto, il plugin analizza un nuovo frame appena la GPU si libera.
+/// - "azione": c'è un portatore → si analizza il più spesso possibile, cioè SENZA limite
+///   (inferenceFrequency = null).
+///   Attenzione: il plugin conta l'intervallo 1/frequenza dalla FINE dell'analisi precedente,
+///   non dall'inizio. Con 30 Hz aspettava 33 ms dopo ogni analisi e poi un frame nuovo della
+///   camera (che ne produce uno ogni 33 ms): ~50 ms persi a ogni frame, ~8 analisi/s invece di
+///   ~14. Per questo in azione il limite si toglie del tutto.
 const int kIdleHz = 2;
-const int kActiveHz = 30;
 
 /// Quanto restare in modalità "azione" dopo l'ultimo portatore visto.
 const Duration kActiveHold = Duration(seconds: 2);
@@ -146,10 +148,22 @@ const int kScoreThreshold = 3;
 /// molto tempo per tornare a 0 e riarmare l'allarme.
 const int kScoreMax = 5;
 
-YOLOStreamingConfig streamingConfigFor(int hz) => YOLOStreamingConfig.custom(
+/// Classi di cui il plugin costruisce e invia la maschera. Ogni maschera 160x120 costa
+/// ~10–20 ms per frame (costruzione, conversione, invio a Dart), quindi si chiedono solo quelle
+/// che servono: i portatori sempre, forbidden_area solo durante la calibrazione (a zona attiva la
+/// zona è un riferimento fisso). ball non serve mai alla logica: arriva solo il box.
+/// (maskClasses è un parametro aggiunto da noi al plugin, vedi packages/ultralytics_yolo.)
+const List<String> kCarrierClasses = ['carrier_ground', 'carrier_jump'];
+const List<String> kCalibMaskClasses = [...kCarrierClasses, 'forbidden_area']; // "..." = spread
+
+/// [active] = modalità azione (nessun limite di frequenza), altrimenti riposo (kIdleHz);
+/// [calibrating] = servono anche le maschere della zona.
+YOLOStreamingConfig streamingConfigFor({required bool active, required bool calibrating}) =>
+    YOLOStreamingConfig.custom(
       includeMasks: true, // servono le maschere in Dart per la logica
-      inferenceFrequency: hz,
+      inferenceFrequency: active ? null : kIdleHz, // null = nessun limite
       analysisResolution: kAnalysisResolution,
+      maskClasses: calibrating ? kCalibMaskClasses : kCarrierClasses,
     );
 
 // ============================================================================================
@@ -548,6 +562,8 @@ class LandingLogic {
     // Camera spostata a zona proposta/attiva → la zona non vale più → ricalibra. Due segnali:
     //  - l'IMU: un movimento è finito con la camera ruotata o è stato forte (non una vibrazione);
     //  - la griglia delle maschere è cambiata (telefono girato tra verticale e orizzontale).
+    //    A zona attiva arrivano solo le maschere dei portatori: senza portatori in vista la
+    //    griglia non si vede, ma una rotazione di 90° è comunque un movimento forte per l'IMU.
     final hasZone = _state == ZoneState.active || _state == ZoneState.proposal;
     final gridChanged = grid != null && (grid.$1 != _gridW || grid.$2 != _gridH);
     if (hasZone && (moved || gridChanged)) {
@@ -700,11 +716,15 @@ class LandingLogic {
 /// è scalata finché copre tutto lo schermo e i bordi in eccesso sono tagliati). Usiamo la
 /// stessa formula del plugin: scala = max(W/w, H/h), immagine centrata. Solo camera posteriore
 /// (con quella frontale l'immagine sarebbe specchiata).
+///
+/// [showDetails] = occhio acceso: zona attiva, portatore e piedi. Con l'occhio spento si
+/// disegna solo la zona in calibrazione/proposta (serve per confermarla).
 class LogicOverlayPainter extends CustomPainter {
   final LandingLogic logic;
   final FrameReport? report;
+  final bool showDetails;
 
-  LogicOverlayPainter(this.logic, this.report);
+  LogicOverlayPainter(this.logic, this.report, {this.showDetails = true});
 
   static final Paint _zoneActivePaint = Paint()..color = Colors.orange.withValues(alpha: 0.35);
   static final Paint _zoneCalibPaint = Paint()..color = Colors.yellow.withValues(alpha: 0.25);
@@ -754,12 +774,14 @@ class LogicOverlayPainter extends CustomPainter {
       ZoneState.proposal => _zoneProposalPaint,
       _ => _zoneCalibPaint, // "_" = tutti gli altri casi, come default: in uno switch C++
     };
-    for (var y = 0; y < gh; y++) {
-      drawRuns(y, (x) => logic.isDisplayZoneCell(x, y), zonePaint);
+    if (showDetails || logic.zoneState != ZoneState.active) {
+      for (var y = 0; y < gh; y++) {
+        drawRuns(y, (x) => logic.isDisplayZoneCell(x, y), zonePaint);
+      }
     }
 
     // 2. Portatore: corpo bianco; se è a terra, fascia dei piedi rossa (nella zona) o azzurra.
-    if (!hasMask) return;
+    if (!showDetails || !hasMask) return;
     final feetTop = report!.feetTop;
     for (var y = 0; y < gh; y++) {
       final row = mask[y];
@@ -830,7 +852,8 @@ class _DetectionPageState extends State<DetectionPage> {
   double _measuredHz = 0; // media mobile esponenziale delle analisi al secondo
 
   // --- Frequenza variabile ---
-  int _currentHz = kIdleHz;
+  bool _activeMode = false; // modalità azione (analisi senza limite di frequenza)
+  bool _zoneMasksOn = true; // il plugin invia anche le maschere di forbidden_area (calibrazione)
   DateTime _lastCarrierSeen = DateTime(2000);
 
   // --- Audio ---
@@ -838,10 +861,12 @@ class _DetectionPageState extends State<DetectionPage> {
   int _autoAlarms = 0; // allarmi decisi dalla logica
   int _manualAlarms = 0; // pressioni del pulsante (per segnare i landing nei test)
 
-  // --- Overlay ---
-  // false = si vede solo il nostro overlay (cosa usa la logica); true = anche box e maschere
-  // grezzi disegnati dal plugin (cosa vede la rete). Si cambia con l'icona a forma di occhio.
-  bool _showRaw = false;
+  // --- Overlay (icona a forma di occhio) ---
+  // false = schermo pulito: solo la zona in calibrazione/proposta (va confermata).
+  // true = tutto: box, confidenze e maschere grezzi del plugin (cosa vede la rete) + il nostro
+  // overlay (zona attiva, portatore, piedi: cosa usa la logica).
+  // Spento è anche più leggero: il plugin non dipinge la sua immagine delle maschere.
+  bool _showOverlays = false;
 
   @override
   void initState() {
@@ -849,7 +874,7 @@ class _DetectionPageState extends State<DetectionPage> {
     // Tiene lo schermo acceso: senza, Android lo spegne, l'app va in pausa e la camera si chiude.
     WakelockPlus.enable();
     // Il controller ricorda l'impostazione anche se la vista nativa non è ancora pronta.
-    _controller.setShowOverlays(_showRaw);
+    _controller.setShowOverlays(_showOverlays);
 
     _startSensors();
   }
@@ -898,9 +923,9 @@ class _DetectionPageState extends State<DetectionPage> {
     setState(() => _logic.startCalibration());
   }
 
-  void _toggleRaw() {
-    setState(() => _showRaw = !_showRaw);
-    _controller.setShowOverlays(_showRaw);
+  void _toggleOverlays() {
+    setState(() => _showOverlays = !_showOverlays);
+    _controller.setShowOverlays(_showOverlays);
   }
 
   /// Pulsante "Ricalibra zona": da premere quando il telefono è stato spostato
@@ -978,11 +1003,18 @@ class _DetectionPageState extends State<DetectionPage> {
   void _updateFrequency(bool carrierVisible) {
     final now = DateTime.now();
     if (carrierVisible) _lastCarrierSeen = now;
-    final wantedHz = now.difference(_lastCarrierSeen) < kActiveHold ? kActiveHz : kIdleHz;
-    if (wantedHz != _currentHz) {
-      _currentHz = wantedHz;
-      debugPrint('Frequenza di analisi → $wantedHz Hz');
-      _controller.setStreamingConfig(streamingConfigFor(wantedHz));
+    final wantActive = now.difference(_lastCarrierSeen) < kActiveHold;
+    final wantZoneMasks = _logic.zoneState == ZoneState.calibrating;
+    if (wantActive != _activeMode || wantZoneMasks != _zoneMasksOn) {
+      if (wantActive != _activeMode) {
+        debugPrint('Frequenza di analisi → ${wantActive ? 'massima (azione)' : '$kIdleHz Hz (riposo)'}');
+      }
+      if (wantZoneMasks != _zoneMasksOn) {
+        debugPrint('Maschere di forbidden_area → ${wantZoneMasks ? 'sì (calibrazione)' : 'no'}');
+      }
+      _activeMode = wantActive;
+      _zoneMasksOn = wantZoneMasks;
+      _controller.setStreamingConfig(streamingConfigFor(active: wantActive, calibrating: wantZoneMasks));
     }
   }
 
@@ -1045,9 +1077,9 @@ class _DetectionPageState extends State<DetectionPage> {
         // "actions": pulsanti a destra nella barra in alto.
         actions: [
           IconButton(
-            tooltip: _showRaw ? 'Nascondi rilevamenti grezzi' : 'Mostra rilevamenti grezzi',
-            icon: Icon(_showRaw ? Icons.visibility : Icons.visibility_off),
-            onPressed: _toggleRaw,
+            tooltip: _showOverlays ? 'Nascondi sovrapposizioni' : 'Mostra tutte le sovrapposizioni',
+            icon: Icon(_showOverlays ? Icons.visibility : Icons.visibility_off),
+            onPressed: _toggleOverlays,
           ),
           IconButton(
             tooltip: 'Ricalibra zona',
@@ -1058,13 +1090,13 @@ class _DetectionPageState extends State<DetectionPage> {
       ),
       body: Stack(
         children: [
-          // Livello 1: camera + rete (se _showRaw, il plugin disegna anche box e maschere grezzi).
+          // Livello 1: camera + rete (se _showOverlays, il plugin disegna anche box e maschere grezzi).
           YOLOView(
             modelPath: kModelPath,
             task: YOLOTask.segment,
             controller: _controller,
             confidenceThreshold: 0.25,
-            streamingConfig: streamingConfigFor(kIdleHz),
+            streamingConfig: streamingConfigFor(active: false, calibrating: true),
             onResult: _onResult,
             onPerformanceMetrics: _onPerformance,
             onModelError: _onModelError,
@@ -1074,7 +1106,7 @@ class _DetectionPageState extends State<DetectionPage> {
           // IgnorePointer: i tocchi passano attraverso e arrivano alla camera (tap per mettere a fuoco).
           Positioned.fill(
             child: IgnorePointer(
-              child: CustomPaint(painter: LogicOverlayPainter(_logic, report)),
+              child: CustomPaint(painter: LogicOverlayPainter(_logic, report, showDetails: _showOverlays)),
             ),
           ),
 
@@ -1116,9 +1148,10 @@ class _DetectionPageState extends State<DetectionPage> {
                       Text('punteggio: ${report.score}   (allarme a $kScoreThreshold)',
                           style: whiteText.copyWith(fontSize: 20, fontWeight: FontWeight.bold)),
                     ],
-                    const Text('zona: gialla = calibrazione/proposta, arancio = attiva · '
-                        'bianco = portatore · piedi: rosso = nella zona, azzurro = fuori',
-                        style: TextStyle(color: Colors.white70, fontSize: 11)),
+                    if (_showOverlays)
+                      const Text('zona: gialla = calibrazione/proposta, arancio = attiva · '
+                          'bianco = portatore · piedi: rosso = nella zona, azzurro = fuori',
+                          style: TextStyle(color: Colors.white70, fontSize: 11)),
                   ],
                 ],
               ),
