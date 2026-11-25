@@ -12,7 +12,8 @@ device.
 A frame counts as a landing when the **feet** (bottom part of the mask) of a `carrier_ground`
 overlap the forbidden area. The area is a fixed reference: at startup (and on demand) the app
 calibrates it for 3 s, taking the per-cell median of the network's `forbidden_area` masks, and
-the user confirms it. After that the network no longer changes it. The area is calibrated again
+the user confirms it. After that the network no longer changes it. The area can also be drawn or
+corrected by hand with a brush (trace the outline, add, erase). The area is calibrated again
 when the phone is moved (gyroscope and accelerometer) and whenever the app returns from the
 background. A rolling score (+1 landing frame, −1 otherwise) triggers the alarm when it reaches
 the threshold.

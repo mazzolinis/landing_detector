@@ -5,6 +5,7 @@
 //        ↺ zona non trovata: nuovo tentativo automatico
 //        ↘ dopo kMaxCalibAttempts tentativi (o kMaxCalibTime): ANALISI FERMA (camera spenta,
 //          per non scaldare il telefono se l'app è partita per errore, es. in tasca) → [Riprova]
+//   In qualsiasi momento: [Disegna] → disegno a mano (pennello) → [Conferma] → attiva.
 //   Durante la calibrazione si raccolgono le maschere di forbidden_area e si prende la
 //   mediana cella per cella. Una volta attiva, la zona è un riferimento FISSO: la rete non
 //   la modifica più (così un errore della rete non si accumula sul riferimento).
@@ -53,7 +54,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 /// ATTENZIONE: il plugin copia il modello dagli asset nella memoria dell'app solo la PRIMA
 /// volta e poi riusa la copia finché il nome non cambia. Quindi un modello nuovo deve avere
 /// SEMPRE un nome nuovo: non sovrascrivere mai un file esistente con un altro modello.
-const String kModelName = 'landing_n640_v2';
+const String kModelName = 'landing_n640_v6';
 
 /// imgsz con cui il modello in uso è stato esportato (il numero nel nome del file).
 const int kModelSize = 640;
@@ -104,6 +105,9 @@ const double kCalibMinSeenFraction = 0.5;
 /// tentativi non verrebbero mai contati.
 const int kMaxCalibAttempts = 5;
 const Duration kMaxCalibTime = Duration(seconds: 30);
+
+/// Raggio del pennello per disegnare la zona, in pixel dello schermo (~ mezzo polpastrello).
+const double kBrushRadiusPx = 22;
 
 /// Telefono "fermo" = per almeno kStillTime nessun campione "in movimento". Un campione è in
 /// movimento se:
@@ -285,7 +289,8 @@ class MotionMonitor {
   /// ne restituisce il riassunto; altrimenti null.
   /// Il risultato è un "record con nomi": come una struct anonima, si legge con r.angleDeg ecc.
   ({double angleDeg, double peakGyro, double peakAccel, bool cameraMoved})? takeFinishedMovement(
-      DateTime now) {
+    DateTime now,
+  ) {
     if (!_inEpisode || !isStill(now)) return null;
     _inEpisode = false;
     final angle = _norm(_ex, _ey, _ez) / _degToRad;
@@ -315,6 +320,7 @@ enum ZoneState {
   proposal, // calibrazione finita: zona proposta, aspetta la conferma dell'utente
   active, // zona di riferimento fissa: si rilevano i landing
   gaveUp, // zona mai trovata: analisi ferma (camera spenta) finché l'utente non riprova
+  editing, // l'utente disegna/corregge la zona a mano: rilevamento in pausa
 }
 
 /// Esito dell'analisi di un frame: serve per il log, per lo schermo e per i test.
@@ -430,6 +436,82 @@ class ZoneCalibrator {
   }
 }
 
+// ============================================================================================
+// Disegno della zona (Dart puro, testabile)
+// ============================================================================================
+
+/// Conversione tra griglia delle maschere e schermo. È la stessa formula del plugin: la camera è
+/// mostrata "a riempimento" (FILL_CENTER), scala = max(W/w, H/h), immagine centrata; i bordi che
+/// escono dallo schermo sono tagliati (dx, dy negativi).
+class GridMapping {
+  final double scale; // pixel dello schermo per cella
+  final double dx, dy; // posizione sullo schermo dell'angolo (0, 0) della griglia
+
+  const GridMapping(this.scale, this.dx, this.dy);
+
+  /// "factory": un costruttore che calcola i campi prima di creare l'oggetto.
+  factory GridMapping.fit(Size screen, int gw, int gh) {
+    final s = math.max(screen.width / gw, screen.height / gh);
+    return GridMapping(s, (screen.width - gw * s) / 2, (screen.height - gh * s) / 2);
+  }
+
+  /// Punto della griglia (in celle, anche frazionarie) → punto dello schermo.
+  Offset toScreen(Offset g) => Offset(dx + g.dx * scale, dy + g.dy * scale);
+
+  /// Punto dello schermo (es. il dito) → punto della griglia.
+  Offset toGrid(Offset p) => Offset((p.dx - dx) / scale, (p.dy - dy) / scale);
+}
+
+/// Riempie il poligono chiuso [pts] (coordinate di griglia): 1 = cella con il centro dentro.
+/// Metodo a "scansione di righe": per ogni riga si cercano i punti in cui i lati del poligono
+/// la attraversano e si riempie tra un attraversamento e il successivo (regola pari/dispari).
+Uint8List fillPolygon(List<Offset> pts, int w, int h) {
+  final out = Uint8List(w * h);
+  if (pts.length < 3) return out;
+  for (var y = 0; y < h; y++) {
+    final cy = y + 0.5; // centro della riga
+    final xs = <double>[];
+    for (var i = 0; i < pts.length; i++) {
+      final a = pts[i];
+      final b = pts[(i + 1) % pts.length]; // l'ultimo punto si collega al primo: bordo chiuso
+      if ((a.dy <= cy && b.dy > cy) || (b.dy <= cy && a.dy > cy)) {
+        xs.add(a.dx + (cy - a.dy) * (b.dx - a.dx) / (b.dy - a.dy));
+      }
+    }
+    xs.sort();
+    for (var k = 0; k + 1 < xs.length; k += 2) {
+      final from = math.max(0, (xs[k] - 0.5).ceil());
+      final to = math.min(w, (xs[k + 1] - 0.5).ceil());
+      for (var x = from; x < to; x++) {
+        out[y * w + x] = 1;
+      }
+    }
+  }
+  return out;
+}
+
+/// Pennello: mette a [value] (1 aggiungi, 0 cancella) le celle entro [radius] celle da [c].
+void paintDisc(Uint8List cells, int w, int h, Offset c, double radius, int value) {
+  final r = math.max(radius, 0.6); // almeno la cella sotto il dito
+  final x0 = math.max(0, (c.dx - r).floor()), x1 = math.min(w - 1, (c.dx + r).ceil());
+  final y0 = math.max(0, (c.dy - r).floor()), y1 = math.min(h - 1, (c.dy + r).ceil());
+  for (var y = y0; y <= y1; y++) {
+    for (var x = x0; x <= x1; x++) {
+      final ddx = x + 0.5 - c.dx, ddy = y + 0.5 - c.dy;
+      if (ddx * ddx + ddy * ddy <= r * r) cells[y * w + x] = value;
+    }
+  }
+}
+
+/// Pennello trascinato da [from] a [to]: dischi ravvicinati lungo il segmento, così anche un
+/// movimento veloce del dito (punti lontani tra due eventi) lascia un tratto continuo.
+void paintStroke(Uint8List cells, int w, int h, Offset from, Offset to, double radius, int value) {
+  final steps = math.max(1, ((to - from).distance / math.max(radius * 0.5, 0.3)).ceil());
+  for (var i = 0; i <= steps; i++) {
+    paintDisc(cells, w, h, Offset.lerp(from, to, i / steps)!, radius, value);
+  }
+}
+
 /// Contiene lo stato che sopravvive tra un frame e l'altro: zona proibita e punteggio.
 /// La decisione "landing sì/no" invece usa solo il frame corrente (analisi a frame singolo).
 class LandingLogic {
@@ -445,6 +527,8 @@ class LandingLogic {
   // piatto (cella (x, y) → indice y * _gridW + x), come in C/C++.
   Uint8List? _zone;
   Uint8List? _proposal;
+  Uint8List? _edit; // zona in corso di disegno (stato editing)
+  ZoneState _stateBeforeEdit = ZoneState.calibrating; // dove tornare se il disegno è annullato
   int _gridW = 0;
   int _gridH = 0;
 
@@ -479,6 +563,8 @@ class LandingLogic {
         return _calib.isMajority(x, y);
       case ZoneState.gaveUp:
         return false;
+      case ZoneState.editing:
+        return _edit![y * _gridW + x] == 1;
     }
   }
 
@@ -513,6 +599,8 @@ class LandingLogic {
             ? '$_failedAttempts tentativi'
             : '${kMaxCalibTime.inSeconds} s senza telefono fermo';
         return 'zona: non trovata ($why) — ANALISI FERMA';
+      case ZoneState.editing:
+        return 'zona: disegno a mano $displayZoneCells celle';
     }
   }
 
@@ -523,6 +611,7 @@ class LandingLogic {
     _calibStart = null;
     _zone = null;
     _proposal = null;
+    _edit = null;
     _gridW = 0; // la griglia verrà presa dal primo frame con maschere
     _gridH = 0;
     _calib.reset(0, 0); // svuota i voti della calibrazione precedente
@@ -540,21 +629,80 @@ class LandingLogic {
   }
 
   /// Imposta direttamente una zona attiva (celle 0/1 su una griglia w x h).
-  /// Servirà al disegno manuale (passo 4b.2); per ora la usano i test.
+  /// La usano la conferma del disegno a mano e i test.
   void setZone(Uint8List cells, int w, int h) {
     assert(cells.length == w * h);
     _zone = cells;
     _proposal = null;
+    _edit = null;
     _gridW = w;
     _gridH = h;
     _state = ZoneState.active;
   }
 
+  // --- Disegno a mano ---
+
+  /// Inizia il disegno partendo dalla zona che si vede adesso (attiva, proposta o calibrazione in
+  /// corso), oppure da una zona vuota. [fallbackW] x [fallbackH] = griglia da usare se non se ne
+  /// conosce ancora una (nessuna maschera ricevuta, es. dopo "analisi ferma").
+  void startEditing({required int fallbackW, required int fallbackH}) {
+    if (_state == ZoneState.editing) return;
+    if (_gridW == 0 || _gridH == 0) {
+      _gridW = fallbackW;
+      _gridH = fallbackH;
+    }
+    final start = Uint8List(_gridW * _gridH);
+    for (var y = 0; y < _gridH; y++) {
+      for (var x = 0; x < _gridW; x++) {
+        if (isDisplayZoneCell(x, y)) start[y * _gridW + x] = 1;
+      }
+    }
+    _edit = start;
+    _stateBeforeEdit = _state;
+    _state = ZoneState.editing;
+  }
+
+  /// "Traccia bordo": il bordo disegnato col dito ([outline], coordinate di griglia) viene chiuso e
+  /// riempito, e sostituisce la zona in disegno. false se il bordo non racchiude nessuna cella.
+  bool traceOutline(List<Offset> outline) {
+    if (_state != ZoneState.editing) return false;
+    final filled = fillPolygon(outline, _gridW, _gridH);
+    if (!filled.contains(1)) return false;
+    _edit = filled;
+    return true;
+  }
+
+  /// Pennello "Aggiungi" ([add] = true) o "Cancella" da [from] a [to] (coordinate di griglia).
+  void brush(Offset from, Offset to, double radiusCells, {required bool add}) {
+    if (_state != ZoneState.editing) return;
+    paintStroke(_edit!, _gridW, _gridH, from, to, radiusCells, add ? 1 : 0);
+  }
+
+  /// La zona disegnata diventa il riferimento fisso. false se è vuota (resta in disegno).
+  bool confirmEditing() {
+    final edit = _edit;
+    if (_state != ZoneState.editing || edit == null || !edit.contains(1)) return false;
+    setZone(edit, _gridW, _gridH);
+    return true;
+  }
+
+  /// Annulla il disegno: si torna alla zona attiva o proposta di prima, altrimenti si calibra.
+  void cancelEditing() {
+    if (_state != ZoneState.editing) return;
+    _edit = null;
+    if (_stateBeforeEdit == ZoneState.active && _zone != null) {
+      _state = ZoneState.active;
+    } else if (_stateBeforeEdit == ZoneState.proposal && _proposal != null) {
+      _state = ZoneState.proposal;
+    } else {
+      startCalibration();
+    }
+  }
+
   /// Analizza i rilevamenti di un frame.
   /// [now] si può passare nei test per simulare il tempo; [still] = telefono fermo (giroscopio);
   /// [moved] = è appena finito un movimento che ha spostato la camera (vedi kMovedAngleDeg).
-  FrameReport process(List<YOLOResult> results,
-      {DateTime? now, bool still = true, bool moved = false}) {
+  FrameReport process(List<YOLOResult> results, {DateTime? now, bool still = true, bool moved = false}) {
     now ??= DateTime.now(); // "??=" assegna solo se è null
 
     // 1. Un solo portatore per frame: quello con la confidenza più alta.
@@ -581,6 +729,11 @@ class LandingLogic {
     final hasZone = _state == ZoneState.active || _state == ZoneState.proposal;
     final gridChanged = grid != null && (grid.$1 != _gridW || grid.$2 != _gridH);
     if (hasZone && (moved || gridChanged)) {
+      startCalibration();
+    }
+    // Durante il disegno i movimenti non contano (la zona si disegna su ciò che si vede ora),
+    // ma un cambio di griglia sì: la zona disegnata non avrebbe più senso → si ricalibra.
+    if (_state == ZoneState.editing && gridChanged) {
       startCalibration();
     }
 
@@ -682,8 +835,7 @@ class LandingLogic {
     return null;
   }
 
-  bool _isSameGrid(List<List<double>> mask) =>
-      mask.length == _gridH && mask[0].length == _gridW;
+  bool _isSameGrid(List<List<double>> mask) => mask.length == _gridH && mask[0].length == _gridW;
 
   /// Conta le celle dei "piedi" (fascia più bassa della maschera del portatore) e quante
   /// di queste sono nella zona attiva. Restituisce (celle piedi, celle nella zona, prima riga).
@@ -754,7 +906,8 @@ class LogSummary {
     final times = _timed == 0
         ? 'tempi -'
         : 'rete ${f(_netSum / _timed)} ms, totale ${f(_totalSum / _timed)} ms (max ${f(_totalMax)})';
-    final text = '$minutes:$seconds | $_frames frame (${f(sec > 0 ? _frames / sec : 0, 1)}/s) | $times | '
+    final text =
+        '$minutes:$seconds | $_frames frame (${f(sec > 0 ? _frames / sec : 0, 1)}/s) | $times | '
         'ground $_ground, jump $_jump, nessuno ${_frames - _ground - _jump} | '
         'landing $_landing, allarmi $_alarms | gyro max ${f(_gyroMax, 2)}, acc max ${f(_accelMax, 1)}';
     _frames = _ground = _jump = _landing = _alarms = _timed = 0;
@@ -796,19 +949,26 @@ String describeThermal(Map<dynamic, dynamic>? info) {
 class LogicOverlayPainter extends CustomPainter {
   final LandingLogic logic;
   final FrameReport? report;
+  final List<Offset> stroke; // bordo che si sta tracciando col dito (coordinate di griglia)
 
-  LogicOverlayPainter(this.logic, this.report);
+  LogicOverlayPainter(this.logic, this.report, {this.stroke = const []});
 
   static final Paint _zoneActivePaint = Paint()..color = Colors.orange.withValues(alpha: 0.35);
   static final Paint _zoneCalibPaint = Paint()..color = Colors.yellow.withValues(alpha: 0.25);
   static final Paint _zoneProposalPaint = Paint()..color = Colors.yellow.withValues(alpha: 0.50);
+  static final Paint _zoneEditPaint = Paint()..color = Colors.lightGreenAccent.withValues(alpha: 0.45);
+  static final Paint _strokePaint = Paint()
+    ..color = Colors.white
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 3;
   static final Paint _bodyPaint = Paint()..color = Colors.white.withValues(alpha: 0.30);
   static final Paint _feetOutPaint = Paint()..color = Colors.cyanAccent.withValues(alpha: 0.75);
   static final Paint _feetInPaint = Paint()..color = Colors.red.withValues(alpha: 0.90);
 
   @override
   void paint(Canvas canvas, Size size) {
-    final mask = report?.carrier?.mask;
+    final editing = logic.zoneState == ZoneState.editing;
+    final mask = editing ? null : report?.carrier?.mask; // durante il disegno niente portatore
     final hasMask = mask != null && mask.isNotEmpty && mask[0].isNotEmpty;
 
     // Dimensioni della griglia: dalla maschera del portatore o, se manca, da quella della zona.
@@ -816,9 +976,10 @@ class LogicOverlayPainter extends CustomPainter {
     final gh = hasMask ? mask.length : logic.gridH;
     if (gw == 0 || gh == 0) return;
 
-    final scale = math.max(size.width / gw, size.height / gh);
-    final dx = (size.width - gw * scale) / 2; // negativo = bordo tagliato
-    final dy = (size.height - gh * scale) / 2;
+    final map = GridMapping.fit(size, gw, gh);
+    final scale = map.scale;
+    final dx = map.dx; // negativo = bordo tagliato
+    final dy = map.dy;
 
     // Disegna, riga per riga, i tratti orizzontali consecutivi di celle "dentro": un
     // rettangolo per tratto invece che uno per cella (migliaia di celle → poche decine di tratti).
@@ -833,10 +994,7 @@ class LogicOverlayPainter extends CustomPainter {
         while (x < gw && inside(x)) {
           x++;
         }
-        canvas.drawRect(
-          Rect.fromLTWH(dx + start * scale, dy + y * scale, (x - start) * scale, scale),
-          paint,
-        );
+        canvas.drawRect(Rect.fromLTWH(dx + start * scale, dy + y * scale, (x - start) * scale, scale), paint);
       }
     }
 
@@ -845,10 +1003,21 @@ class LogicOverlayPainter extends CustomPainter {
     final zonePaint = switch (logic.zoneState) {
       ZoneState.active => _zoneActivePaint,
       ZoneState.proposal => _zoneProposalPaint,
+      ZoneState.editing => _zoneEditPaint,
       _ => _zoneCalibPaint, // "_" = tutti gli altri casi, come default: in uno switch C++
     };
     for (var y = 0; y < gh; y++) {
       drawRuns(y, (x) => logic.isDisplayZoneCell(x, y), zonePaint);
+    }
+
+    // Bordo in corso di tracciamento: una linea bianca che segue il dito.
+    if (stroke.length > 1) {
+      final path = Path()..moveTo(map.toScreen(stroke.first).dx, map.toScreen(stroke.first).dy);
+      for (final p in stroke.skip(1)) {
+        final s = map.toScreen(p);
+        path.lineTo(s.dx, s.dy);
+      }
+      canvas.drawPath(path, _strokePaint);
     }
 
     // 2. Portatore: corpo bianco; se è a terra, fascia dei piedi rossa (nella zona) o azzurra.
@@ -876,6 +1045,9 @@ class LogicOverlayPainter extends CustomPainter {
 void main() {
   runApp(const LandingApp());
 }
+
+/// Strumenti del disegno a mano della zona.
+enum BrushTool { trace, add, erase }
 
 /// Widget radice dell'app: imposta tema e schermata iniziale. Non ha stato.
 class LandingApp extends StatelessWidget {
@@ -945,6 +1117,11 @@ class _DetectionPageState extends State<DetectionPage> {
   // true = in più box, confidenze e maschere grezzi disegnati dal plugin (cosa vede la rete).
   // La differenza di velocità è trascurabile: ~1-2 ms per frame (speed_3).
   bool _showRaw = false;
+
+  // --- Disegno a mano della zona ---
+  BrushTool _tool = BrushTool.trace;
+  List<Offset> _stroke = []; // bordo in corso (Traccia), coordinate di griglia
+  Offset? _lastBrush; // ultimo punto del pennello (Aggiungi/Cancella), coordinate di griglia
 
   @override
   void initState() {
@@ -1041,14 +1218,91 @@ class _DetectionPageState extends State<DetectionPage> {
     WakelockPlus.disable(); // lo schermo può spegnersi da solo
   }
 
-  /// Pulsante "Riprova": riaccende tutto e riparte con una calibrazione nuova.
-  void _resumeAnalysis() {
-    debugPrint('*** RIPRESA ANALISI (utente) ***');
+  /// Riaccende camera, sensori, riepilogo e schermo dopo "analisi ferma".
+  void _wakeUp() {
     WakelockPlus.enable();
     _startSensors();
     _startSummary();
     _controller.resume();
+  }
+
+  /// Pulsante "Riprova": riaccende tutto e riparte con una calibrazione nuova.
+  void _resumeAnalysis() {
+    debugPrint('*** RIPRESA ANALISI (utente) ***');
+    _wakeUp();
     setState(() => _logic.startCalibration());
+  }
+
+  /// Pulsanti "Disegna" / "Correggi" / "Disegna a mano": entra nel disegno a mano.
+  void _onStartDrawing() {
+    if (_logic.zoneState == ZoneState.gaveUp) _wakeUp(); // per disegnare serve vedere il campo
+    // Griglia se non se ne conosce ancora una: frame 4:3, una cella ogni 4 pixel del frame
+    // (160x120 in orizzontale, 120x160 in verticale con imgsz 640).
+    final long = kAnalysisResolution.width ~/ 4, short = kAnalysisResolution.height ~/ 4;
+    final portrait = MediaQuery.of(context).orientation == Orientation.portrait;
+    setState(() {
+      _logic.startEditing(fallbackW: portrait ? short : long, fallbackH: portrait ? long : short);
+      _tool = _logic.displayZoneCells == 0 ? BrushTool.trace : BrushTool.add;
+      _stroke = [];
+    });
+    debugPrint('*** DISEGNO ZONA: inizio (${_logic.displayZoneCells} celle di partenza) ***');
+  }
+
+  void _onConfirmDrawing() {
+    if (!_logic.confirmEditing()) {
+      _showMessage('La zona è vuota: traccia il bordo o usa Aggiungi');
+      return;
+    }
+    debugPrint('*** ZONA DISEGNATA A MANO CONFERMATA: ${_logic.zoneText} ***');
+    setState(() {});
+  }
+
+  void _onCancelDrawing() {
+    setState(() => _logic.cancelEditing());
+    debugPrint('*** DISEGNO ZONA ANNULLATO: ${_logic.zoneText} ***');
+  }
+
+  /// Messaggio breve in basso (SnackBar), che sparisce da solo.
+  void _showMessage(String text) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  // Gesti del dito sull'immagine durante il disegno. [map] converte lo schermo in griglia.
+  void _onDrawStart(Offset screen, GridMapping map) {
+    final g = map.toGrid(screen);
+    setState(() {
+      if (_tool == BrushTool.trace) {
+        _stroke = [g];
+      } else {
+        _lastBrush = g;
+        _logic.brush(g, g, kBrushRadiusPx / map.scale, add: _tool == BrushTool.add);
+      }
+    });
+  }
+
+  void _onDrawUpdate(Offset screen, GridMapping map) {
+    final g = map.toGrid(screen);
+    setState(() {
+      if (_tool == BrushTool.trace) {
+        // Un punto ogni ~mezza cella basta e tiene il bordo leggero.
+        if (_stroke.isEmpty || (_stroke.last - g).distance >= 0.5) _stroke = [..._stroke, g];
+      } else {
+        _logic.brush(_lastBrush ?? g, g, kBrushRadiusPx / map.scale, add: _tool == BrushTool.add);
+        _lastBrush = g;
+      }
+    });
+  }
+
+  void _onDrawEnd() {
+    if (_tool == BrushTool.trace && _stroke.isNotEmpty) {
+      if (!_logic.traceOutline(_stroke)) {
+        _showMessage('Bordo troppo piccolo: disegna tutto il contorno della zona');
+      }
+    }
+    setState(() {
+      _stroke = [];
+      _lastBrush = null;
+    });
   }
 
   void _toggleRaw() {
@@ -1085,12 +1339,16 @@ class _DetectionPageState extends State<DetectionPage> {
       // Durante la calibrazione non c'è una zona da buttare: il movimento l'ha già fatta ripartire.
       final effect = _logic.zoneState == ZoneState.calibrating
           ? '(calibrazione in corso)'
+          : _logic.zoneState == ZoneState.editing
+          ? '(disegno in corso: si disegna su ciò che si vede ora)'
           : moved
-              ? '→ ricalibrazione'
-              : '(vibrazione, zona invariata)';
-      debugPrint('*** FINE MOVIMENTO: ruotata di ${movement.angleDeg.toStringAsFixed(1)}°, '
-          'picco ${movement.peakGyro.toStringAsFixed(2)} rad/s, '
-          '${movement.peakAccel.toStringAsFixed(1)} m/s² $effect ***');
+          ? '→ ricalibrazione'
+          : '(vibrazione, zona invariata)';
+      debugPrint(
+        '*** FINE MOVIMENTO: ruotata di ${movement.angleDeg.toStringAsFixed(1)}°, '
+        'picco ${movement.peakGyro.toStringAsFixed(2)} rad/s, '
+        '${movement.peakAccel.toStringAsFixed(1)} m/s² $effect ***',
+      );
     }
     final stateBefore = _logic.zoneState;
     final failedBefore = _logic.failedAttempts;
@@ -1121,9 +1379,11 @@ class _DetectionPageState extends State<DetectionPage> {
 
   /// Log completo di un frame (solo con kFullLog).
   void _logFrame(List<YOLOResult> results, FrameReport report, double gyro, double angle, double accel) {
-    debugPrint('frame [${_measuredHz.toStringAsFixed(1)}/s, gyro ${gyro.toStringAsFixed(2)} rad/s '
-        '${angle.toStringAsFixed(1)}°/1s, acc ${accel.toStringAsFixed(1)} m/s²]: '
-        '${results.isEmpty ? '(niente)' : results.map(_describe).join(' | ')}');
+    debugPrint(
+      'frame [${_measuredHz.toStringAsFixed(1)}/s, gyro ${gyro.toStringAsFixed(2)} rad/s '
+      '${angle.toStringAsFixed(1)}°/1s, acc ${accel.toStringAsFixed(1)} m/s²]: '
+      '${results.isEmpty ? '(niente)' : results.map(_describe).join(' | ')}',
+    );
     debugPrint('logica: ${report.describe()}');
   }
 
@@ -1142,7 +1402,9 @@ class _DetectionPageState extends State<DetectionPage> {
   void _updateFrequency(bool carrierVisible) {
     final now = DateTime.now();
     if (carrierVisible) _lastCarrierSeen = now;
-    final wantActive = now.difference(_lastCarrierSeen) < kActiveHold;
+    // Durante il disegno l'analisi non serve: ritmo di riposo (l'anteprima resta fluida).
+    final wantActive =
+        _logic.zoneState != ZoneState.editing && now.difference(_lastCarrierSeen) < kActiveHold;
     final wantZoneMasks = _logic.zoneState == ZoneState.calibrating;
     if (wantActive != _activeMode || wantZoneMasks != _zoneMasksOn) {
       if (kFullLog && wantActive != _activeMode) {
@@ -1170,12 +1432,15 @@ class _DetectionPageState extends State<DetectionPage> {
   void _onPerformance(YOLOPerformanceMetrics m) {
     _summary.addTiming(m.inferenceMs, m.processingTimeMs);
     if (kFullLog) {
-      debugPrint('tempi: rete ${m.inferenceMs.toStringAsFixed(0)} ms, '
-          'totale ${m.processingTimeMs.toStringAsFixed(0)} ms');
+      debugPrint(
+        'tempi: rete ${m.inferenceMs.toStringAsFixed(0)} ms, '
+        'totale ${m.processingTimeMs.toStringAsFixed(0)} ms',
+      );
     }
     if (!mounted) return;
     setState(() {
-      _perfText = 'rete ${m.inferenceMs.toStringAsFixed(0)} ms, '
+      _perfText =
+          'rete ${m.inferenceMs.toStringAsFixed(0)} ms, '
           'totale ${m.processingTimeMs.toStringAsFixed(0)} ms';
     });
   }
@@ -1209,10 +1474,69 @@ class _DetectionPageState extends State<DetectionPage> {
     super.dispose();
   }
 
+  /// Barra in basso durante il disegno: istruzioni, scelta dello strumento, Annulla/Conferma.
+  Widget _drawingToolbar() {
+    final hint = switch (_tool) {
+      BrushTool.trace => 'Disegna col dito il bordo della zona: si chiude e si riempie da solo',
+      BrushTool.add => 'Passa il dito per aggiungere celle alla zona',
+      BrushTool.erase => 'Passa il dito per cancellare celle dalla zona',
+    };
+    return Container(
+      color: Colors.black54,
+      padding: const EdgeInsets.all(8),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            '$hint · ${_logic.displayZoneCells} celle',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white),
+          ),
+          const SizedBox(height: 8),
+          // SegmentedButton: pulsanti affiancati di cui uno solo è selezionato (come dei "radio").
+          SegmentedButton<BrushTool>(
+            segments: const [
+              ButtonSegment(value: BrushTool.trace, icon: Icon(Icons.gesture), label: Text('Traccia bordo')),
+              ButtonSegment(value: BrushTool.add, icon: Icon(Icons.brush), label: Text('Aggiungi')),
+              ButtonSegment(
+                value: BrushTool.erase,
+                icon: Icon(Icons.auto_fix_normal),
+                label: Text('Cancella'),
+              ),
+            ],
+            selected: {_tool}, // un "Set" con l'elemento selezionato
+            onSelectionChanged: (s) => setState(() => _tool = s.first),
+            style: SegmentedButton.styleFrom(backgroundColor: Colors.white70),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              OutlinedButton.icon(
+                onPressed: _onCancelDrawing,
+                icon: const Icon(Icons.close),
+                label: const Text('Annulla'),
+                style: OutlinedButton.styleFrom(foregroundColor: Colors.white),
+              ),
+              const SizedBox(width: 12),
+              FilledButton.icon(
+                onPressed: _onConfirmDrawing,
+                icon: const Icon(Icons.check),
+                label: const Text('Conferma'),
+                style: FilledButton.styleFrom(backgroundColor: Colors.green),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     const whiteText = TextStyle(color: Colors.white, fontSize: 14);
     final report = _report;
+    final editing = _logic.zoneState == ZoneState.editing;
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -1226,10 +1550,11 @@ class _DetectionPageState extends State<DetectionPage> {
             onPressed: _toggleRaw,
           ),
           IconButton(
-            tooltip: 'Ricalibra zona',
-            icon: const Icon(Icons.refresh),
-            onPressed: _onRecalibrate,
+            tooltip: 'Disegna zona',
+            icon: const Icon(Icons.brush),
+            onPressed: editing ? null : _onStartDrawing, // null = pulsante disattivato
           ),
+          IconButton(tooltip: 'Ricalibra zona', icon: const Icon(Icons.refresh), onPressed: _onRecalibrate),
         ],
       ),
       body: Stack(
@@ -1247,112 +1572,168 @@ class _DetectionPageState extends State<DetectionPage> {
           ),
 
           // Livello 2: il nostro overlay, grande quanto la camera (Positioned.fill).
-          // IgnorePointer: i tocchi passano attraverso e arrivano alla camera (tap per mettere a fuoco).
+          // Normalmente IgnorePointer: i tocchi passano alla camera (tap per mettere a fuoco).
+          // Durante il disegno un GestureDetector riceve il dito; LayoutBuilder dà la dimensione
+          // del riquadro, che serve a convertire i punti dello schermo in celle della griglia.
           Positioned.fill(
-            child: IgnorePointer(
-              child: CustomPaint(painter: LogicOverlayPainter(_logic, report)),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final paint = CustomPaint(
+                  size: constraints.biggest,
+                  painter: LogicOverlayPainter(_logic, report, stroke: _stroke),
+                );
+                if (!editing) return IgnorePointer(child: paint);
+                final map = GridMapping.fit(constraints.biggest, _logic.gridW, _logic.gridH);
+                return GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onPanStart: (d) => _onDrawStart(d.localPosition, map),
+                  onPanUpdate: (d) => _onDrawUpdate(d.localPosition, map),
+                  onPanEnd: (_) => _onDrawEnd(),
+                  onTapDown: (d) => _onDrawStart(d.localPosition, map), // un tocco = una pennellata
+                  onTapUp: (_) => _onDrawEnd(),
+                  child: paint,
+                );
+              },
             ),
           ),
 
-          // Livello 3: pannello con lo stato della logica.
-          Positioned(
-            left: 8,
-            right: 8,
-            top: 8,
-            child: Container(
-              padding: const EdgeInsets.all(8),
-              // Sfondo rosso se il frame corrente è un landing, altrimenti nero semitrasparente.
-              color: (report?.landing ?? false) ? Colors.red.withValues(alpha: 0.7) : Colors.black54,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (_modelError != null)
-                    Text(_modelError!, style: const TextStyle(color: Colors.redAccent))
-                  else ...[
-                    Text('$_perfText | analisi reali ${_measuredHz.toStringAsFixed(1)}/s', style: whiteText),
-                    if (_thermalText.isNotEmpty) Text(_thermalText, style: whiteText),
-                    if (report != null) ...[
+          // Livello 3: pannello con lo stato della logica (nascosto mentre si disegna, per lasciare
+          // libera l'immagine).
+          if (!editing)
+            Positioned(
+              left: 8,
+              right: 8,
+              top: 8,
+              child: Container(
+                padding: const EdgeInsets.all(8),
+                // Sfondo rosso se il frame corrente è un landing, altrimenti nero semitrasparente.
+                color: (report?.landing ?? false) ? Colors.red.withValues(alpha: 0.7) : Colors.black54,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (_modelError != null)
+                      Text(_modelError!, style: const TextStyle(color: Colors.redAccent))
+                    else ...[
                       Text(
-                        report.carrier == null
-                            ? 'portatore: nessuno'
-                            : 'portatore: ${report.carrier!.className} '
-                                '${report.carrier!.confidence.toStringAsFixed(2)}',
+                        '$_perfText | analisi reali ${_measuredHz.toStringAsFixed(1)}/s',
                         style: whiteText,
                       ),
-                      Text(
+                      if (_thermalText.isNotEmpty) Text(_thermalText, style: whiteText),
+                      if (report != null) ...[
+                        Text(
+                          report.carrier == null
+                              ? 'portatore: nessuno'
+                              : 'portatore: ${report.carrier!.className} '
+                                    '${report.carrier!.confidence.toStringAsFixed(2)}',
+                          style: whiteText,
+                        ),
+                        Text(
                           'piedi nella zona: ${report.feetInZone}/${report.feetCells} celle '
                           '(${report.feetPercent}%)',
-                          style: whiteText),
-                      if (!report.still)
-                        Text('telefono in movimento: rilevamento in pausa',
-                            style: whiteText.copyWith(color: Colors.yellow)),
-                      Text(report.zoneText,
+                          style: whiteText,
+                        ),
+                        if (!report.still)
+                          Text(
+                            'telefono in movimento: rilevamento in pausa',
+                            style: whiteText.copyWith(color: Colors.yellow),
+                          ),
+                        Text(
+                          report.zoneText,
                           style: whiteText.copyWith(
-                              color: report.zoneState == ZoneState.active ? Colors.white : Colors.yellow)),
-                      Text('punteggio: ${report.score}   (allarme a $kScoreThreshold)',
-                          style: whiteText.copyWith(fontSize: 20, fontWeight: FontWeight.bold)),
-                    ],
-                    const Text('zona: gialla = calibrazione/proposta, arancio = attiva · '
+                            color: report.zoneState == ZoneState.active ? Colors.white : Colors.yellow,
+                          ),
+                        ),
+                        Text(
+                          'punteggio: ${report.score}   (allarme a $kScoreThreshold)',
+                          style: whiteText.copyWith(fontSize: 20, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                      const Text(
+                        'zona: gialla = calibrazione/proposta, arancio = attiva · '
                         'bianco = portatore · piedi: rosso = nella zona, azzurro = fuori',
-                        style: TextStyle(color: Colors.white70, fontSize: 11)),
+                        style: TextStyle(color: Colors.white70, fontSize: 11),
+                      ),
+                    ],
                   ],
+                ),
+              ),
+            ),
+
+          // Livello 4 (disegno): strumenti del pennello.
+          if (editing) Positioned(left: 0, right: 0, bottom: 16, child: _drawingToolbar()),
+
+          // Livello 4: pulsante per segnare manualmente un landing e contatori.
+          if (!editing)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 24,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Analisi ferma: messaggio e pulsante per riaccendere.
+                  if (_logic.zoneState == ZoneState.gaveUp) ...[
+                    const Text(
+                      'Zona non trovata: analisi ferma',
+                      style: TextStyle(color: Colors.yellow, fontSize: 18),
+                    ),
+                    const SizedBox(height: 4),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: _resumeAnalysis,
+                          icon: const Icon(Icons.play_arrow),
+                          label: const Text('Riprova'),
+                        ),
+                        const SizedBox(width: 12),
+                        FilledButton.icon(
+                          onPressed: _onStartDrawing,
+                          icon: const Icon(Icons.brush),
+                          label: const Text('Disegna a mano'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                  ],
+                  // Pulsanti della zona: compaiono solo quando servono ("collection if").
+                  if (_logic.zoneState == ZoneState.proposal)
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: _onConfirmZone,
+                          icon: const Icon(Icons.check),
+                          label: const Text('Conferma zona'),
+                          style: FilledButton.styleFrom(backgroundColor: Colors.green),
+                        ),
+                        const SizedBox(width: 8),
+                        FilledButton.icon(
+                          onPressed: _onStartDrawing,
+                          icon: const Icon(Icons.brush),
+                          label: const Text('Correggi'),
+                        ),
+                        const SizedBox(width: 8),
+                        FilledButton.icon(
+                          onPressed: _onRecalibrate,
+                          icon: const Icon(Icons.refresh),
+                          label: const Text('Ricalibra'),
+                        ),
+                      ],
+                    ),
+                  const SizedBox(height: 12),
+                  FilledButton.icon(
+                    onPressed: _onManualPressed,
+                    icon: const Icon(Icons.campaign, size: 32),
+                    label: const Text('LANDING!', style: TextStyle(fontSize: 24)),
+                    style: FilledButton.styleFrom(backgroundColor: Colors.red),
+                  ),
+                  const SizedBox(height: 8),
+                  Text('Allarmi automatici: $_autoAlarms   manuali: $_manualAlarms', style: whiteText),
                 ],
               ),
             ),
-          ),
-
-          // Livello 4: pulsante per segnare manualmente un landing e contatori.
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 24,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // Analisi ferma: messaggio e pulsante per riaccendere.
-                if (_logic.zoneState == ZoneState.gaveUp) ...[
-                  const Text('Zona non trovata: analisi ferma',
-                      style: TextStyle(color: Colors.yellow, fontSize: 18)),
-                  const SizedBox(height: 4),
-                  FilledButton.icon(
-                    onPressed: _resumeAnalysis,
-                    icon: const Icon(Icons.play_arrow),
-                    label: const Text('Riprova'),
-                  ),
-                  const SizedBox(height: 8),
-                ],
-                // Pulsanti della zona: compaiono solo quando servono ("collection if").
-                if (_logic.zoneState == ZoneState.proposal)
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      FilledButton.icon(
-                        onPressed: _onConfirmZone,
-                        icon: const Icon(Icons.check),
-                        label: const Text('Conferma zona'),
-                        style: FilledButton.styleFrom(backgroundColor: Colors.green),
-                      ),
-                      const SizedBox(width: 12),
-                      FilledButton.icon(
-                        onPressed: _onRecalibrate,
-                        icon: const Icon(Icons.refresh),
-                        label: const Text('Ricalibra'),
-                      ),
-                    ],
-                  ),
-                const SizedBox(height: 12),
-                FilledButton.icon(
-                  onPressed: _onManualPressed,
-                  icon: const Icon(Icons.campaign, size: 32),
-                  label: const Text('LANDING!', style: TextStyle(fontSize: 24)),
-                  style: FilledButton.styleFrom(backgroundColor: Colors.red),
-                ),
-                const SizedBox(height: 8),
-                Text('Allarmi automatici: $_autoAlarms   manuali: $_manualAlarms', style: whiteText),
-              ],
-            ),
-          ),
         ],
       ),
     );

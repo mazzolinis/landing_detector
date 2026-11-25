@@ -7,7 +7,7 @@
 
 import 'dart:math' as math;
 import 'dart:typed_data';
-import 'dart:ui' show Canvas, PictureRecorder, Rect, Size;
+import 'dart:ui' show Canvas, Offset, PictureRecorder, Rect, Size;
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:landing_detector/main.dart';
@@ -453,6 +453,100 @@ void main() {
   });
 
   // ------------------------------------------------------------------------------------------
+  // Disegno a mano della zona
+  // ------------------------------------------------------------------------------------------
+
+  test('GridMapping: schermo ↔ griglia, con i bordi tagliati come la camera', () {
+    // Griglia 120x160 (verticale) su schermo 400x800: scala = max(400/120, 800/160) = 5,
+    // larghezza 600 px > 400 → 100 px tagliati per lato (dx = -100).
+    final map = GridMapping.fit(const Size(400, 800), 120, 160);
+    expect(map.scale, 5);
+    expect(map.dx, -100);
+    expect(map.dy, 0);
+    expect(map.toGrid(const Offset(200, 400)), const Offset(60, 80)); // centro → centro
+    expect(map.toScreen(map.toGrid(const Offset(37, 512))), const Offset(37, 512));
+  });
+
+  test('fillPolygon: un quadrato riempie le celle col centro dentro', () {
+    final cells = fillPolygon(const [Offset(2, 2), Offset(6, 2), Offset(6, 5), Offset(2, 5)], w, h);
+    expect(cells.where((c) => c == 1).length, 4 * 3); // colonne 2..5, righe 2..4
+    expect(cells[3 * w + 4], 1);
+    expect(cells[3 * w + 6], 0);
+    expect(fillPolygon(const [Offset(1, 1), Offset(3, 3)], w, h).contains(1), isFalse); // < 3 punti
+  });
+
+  test('pennello: aggiunge e cancella un tratto continuo', () {
+    final cells = Uint8List(w * h);
+    paintStroke(cells, w, h, const Offset(2.5, 10.5), const Offset(17.5, 10.5), 1.0, 1);
+    for (var x = 2; x <= 17; x++) {
+      expect(cells[10 * w + x], 1, reason: 'colonna $x'); // nessun buco lungo il tratto
+    }
+    paintDisc(cells, w, h, const Offset(10.5, 10.5), 1.0, 0);
+    expect(cells[10 * w + 10], 0);
+    expect(cells[10 * w + 2], 1);
+  });
+
+  test('disegno: correggere la proposta e confermarla', () {
+    final logic = LandingLogic();
+    calibrate(logic, (_) => [zone]); // proposta: righe 10..19
+    logic.startEditing(fallbackW: 99, fallbackH: 99); // griglia già nota: il fallback non si usa
+    expect(logic.zoneState, ZoneState.editing);
+    expect(logic.gridW, w);
+    expect(logic.displayZoneCells, 10 * w); // si parte dalla proposta
+    logic.brush(const Offset(0, 15.5), const Offset(20, 15.5), 0.6, add: false); // cancella la riga 15
+    expect(logic.displayZoneCells, 9 * w);
+    expect(logic.process([zone, groundInZone]).landing, isFalse); // durante il disegno: pausa
+    expect(logic.confirmEditing(), isTrue);
+    expect(logic.zoneState, ZoneState.active);
+    expect(logic.isZoneCell(5, 15), isFalse);
+    expect(logic.isZoneCell(5, 16), isTrue);
+  });
+
+  test('disegno: Traccia bordo sostituisce la zona', () {
+    final logic = activeLogic();
+    logic.startEditing(fallbackW: w, fallbackH: h);
+    expect(logic.traceOutline(const [Offset(0, 0), Offset(10, 0), Offset(10, 5), Offset(0, 5)]), isTrue);
+    expect(logic.displayZoneCells, 10 * 5);
+    expect(logic.traceOutline(const [Offset(3, 3), Offset(3.2, 3.1), Offset(3.1, 3.3)]), isFalse); // minuscolo
+    expect(logic.displayZoneCells, 10 * 5); // non cambia
+  });
+
+  test('disegno: zona vuota non si conferma; Annulla torna a prima', () {
+    final logic = activeLogic();
+    logic.startEditing(fallbackW: w, fallbackH: h);
+    logic.brush(const Offset(-5, 15), const Offset(25, 15), 6, add: false); // cancella tutto
+    expect(logic.confirmEditing(), isFalse);
+    expect(logic.zoneState, ZoneState.editing);
+    logic.cancelEditing();
+    expect(logic.zoneState, ZoneState.active);
+    expect(logic.displayZoneCells, 10 * w); // la zona di prima è intatta
+  });
+
+  test('disegno da analisi ferma: griglia di riserva; Annulla → calibrazione', () {
+    final logic = LandingLogic();
+    final t0 = DateTime(2026, 1, 1, 12);
+    for (var i = 0; logic.zoneState != ZoneState.gaveUp && i < 1000; i++) {
+      logic.process([], now: t0.add(Duration(milliseconds: 125 * i)));
+    }
+    logic.startEditing(fallbackW: 12, fallbackH: 16);
+    expect(logic.zoneState, ZoneState.editing);
+    expect((logic.gridW, logic.gridH), (12, 16));
+    expect(logic.displayZoneCells, 0); // si parte da vuota
+    logic.cancelEditing();
+    expect(logic.zoneState, ZoneState.calibrating);
+  });
+
+  test('disegno: un movimento non lo interrompe, un cambio di griglia sì', () {
+    final logic = activeLogic();
+    logic.startEditing(fallbackW: w, fallbackH: h);
+    logic.process([groundInZone], moved: true);
+    expect(logic.zoneState, ZoneState.editing);
+    final rotated = det('carrier_ground', 0.5, [for (var y = 0; y < 30; y++) List.filled(15, 1.0)]);
+    logic.process([rotated]);
+    expect(logic.zoneState, ZoneState.calibrating);
+  });
+
+  // ------------------------------------------------------------------------------------------
   // Riepilogo
   // ------------------------------------------------------------------------------------------
 
@@ -497,9 +591,11 @@ void main() {
       (active, activeReport),
       (active, active.process([rotated])), // griglia cambiata → ricalibrazione
       (LandingLogic(), null),
+      (activeLogic()..startEditing(fallbackW: w, fallbackH: h), activeReport), // disegno
     ];
     for (final (logic, report) in cases) {
-      LogicOverlayPainter(logic, report).paint(Canvas(PictureRecorder()), const Size(400, 800));
+      LogicOverlayPainter(logic, report, stroke: const [Offset(1, 1), Offset(5, 3), Offset(2, 8)])
+          .paint(Canvas(PictureRecorder()), const Size(400, 800));
     }
   });
 }
