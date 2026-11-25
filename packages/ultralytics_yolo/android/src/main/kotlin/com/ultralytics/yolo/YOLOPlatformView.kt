@@ -235,6 +235,28 @@ class YOLOPlatformView(
     }
     
     /**
+     * [landing_detector] Device temperature as far as apps can see it (CPU/GPU sensors are not accessible):
+     * - batteryC: battery temperature in Celsius;
+     * - thermalStatus: 0 none, 1 light, 2 moderate, 3 severe, 4 critical, 5 emergency, 6 shutdown (API 29+);
+     * - thermalHeadroom: 0..1, where 1.0 is the threshold of "severe" throttling (API 30+).
+     */
+    private fun thermalInfo(): Map<String, Any> {
+        val info = HashMap<String, Any>()
+        val battery = context.applicationContext.registerReceiver(
+            null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED)
+        )
+        val tenths = battery?.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE) ?: Int.MIN_VALUE
+        if (tenths != Int.MIN_VALUE) info["batteryC"] = tenths / 10.0
+        val power = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+        if (power != null && android.os.Build.VERSION.SDK_INT >= 29) info["thermalStatus"] = power.currentThermalStatus
+        if (power != null && android.os.Build.VERSION.SDK_INT >= 30) {
+            val headroom = power.getThermalHeadroom(0) // NaN when unsupported or asked too often
+            if (!headroom.isNaN()) info["thermalHeadroom"] = headroom.toDouble()
+        }
+        return info
+    }
+
+    /**
      * Attempt to send stream data
      */
     private fun sendStreamData(streamData: Map<String, Any>): Boolean {
@@ -442,6 +464,8 @@ class YOLOPlatformView(
                         result.error("invalid_args", "Invalid streaming config", null)
                     }
                 }
+                // [landing_detector] Battery temperature and thermal state, for the app's periodic summary.
+                "getThermalInfo" -> result.success(thermalInfo())
                 "setShowOverlays" -> {
                     val visible = call.argument<Boolean>("visible")
                     if (visible != null) {

@@ -317,13 +317,20 @@ void main() {
     expect(r.landing, isTrue);
   });
 
-  test('pochi piedi nella zona rispetto al totale → NON è landing', () {
-    // Giocatore largo (colonne 8..19): 4 celle nella zona su 24 (17%): sopra kFeetMinCells
-    // ma sotto kFeetMinFraction (il caso dei falsi positivi visti in fault_logic_1).
+  test('pochi piedi nella zona rispetto al totale → landing (kFeetMinFraction = 0)', () {
+    // Giocatore largo (colonne 8..19): 4 celle nella zona su 24 (17%), sopra kFeetMinCells.
     final wide = det('carrier_ground', 0.7, rectMask(8, 5, 19, 14));
     final r = activeLogic(leftZone).process([wide]);
-    expect(r.feetInZone, greaterThanOrEqualTo(kFeetMinCells));
-    expect(r.feetInZone, lessThan(kFeetMinFraction * r.feetCells));
+    expect(r.feetInZone, 4);
+    expect(r.feetCells, 24);
+    expect(r.landing, isTrue);
+  });
+
+  test('meno di kFeetMinCells celle nella zona → NON è landing', () {
+    // Giocatore colonne 9..18: solo la colonna 9 è nella zona, 2 celle (rumore del bordo).
+    final edge = det('carrier_ground', 0.7, rectMask(9, 5, 18, 14));
+    final r = activeLogic(leftZone).process([edge]);
+    expect(r.feetInZone, 2);
     expect(r.landing, isFalse);
   });
 
@@ -443,6 +450,32 @@ void main() {
     final logic = activeLogic();
     logic.process([groundInZone], moved: true);
     expect(logic.zoneState, ZoneState.calibrating);
+  });
+
+  // ------------------------------------------------------------------------------------------
+  // Riepilogo
+  // ------------------------------------------------------------------------------------------
+
+  test('riepilogo: conta, media e si azzera', () {
+    final logic = activeLogic();
+    final summary = LogSummary();
+    for (var i = 0; i < 4; i++) {
+      summary.addFrame(logic.process([groundInZone]), gyro: 0.01 * i, accel: 0.5);
+      summary.addTiming(30, 40.0 + i);
+    }
+    final text = summary.flush(window: const Duration(seconds: 2), uptime: const Duration(seconds: 75));
+    expect(text, startsWith('01:15 | 4 frame (2.0/s)'));
+    expect(text, contains('totale 42 ms (max 43)'));
+    expect(text, contains('ground 4, jump 0, nessuno 0 | landing 4, allarmi 1'));
+    expect(text, contains('gyro max 0.03'));
+    expect(summary.flush(window: const Duration(seconds: 2), uptime: Duration.zero), contains('0 frame (0.0/s) | tempi -'));
+  });
+
+  test('stato termico: testo leggibile anche con dati mancanti', () {
+    expect(describeThermal({'batteryC': 34.25, 'thermalStatus': 1, 'thermalHeadroom': 0.7}),
+        'batteria 34.3 °C, termico 1 (leggero), margine 0.70');
+    expect(describeThermal({'batteryC': 30.0}), 'batteria 30.0 °C');
+    expect(describeThermal(null), 'temperatura n/d');
   });
 
   // ------------------------------------------------------------------------------------------

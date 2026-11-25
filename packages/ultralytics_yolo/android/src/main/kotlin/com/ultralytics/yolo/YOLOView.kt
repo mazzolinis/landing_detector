@@ -1382,11 +1382,14 @@ class YOLOView @JvmOverloads constructor(
 
     // region onFrame (per frame inference)
 
-    // [landing_detector] Per-frame time budget of the analysis thread, logged as averages every
-    // TIMING_FRAMES analysed frames (tag "LandingTiming"). Only frames that actually run inference count.
-    private val TIMING_FRAMES = 30
-    private var timingCount = 0
+    // [landing_detector] Time budget of the analysis thread, logged as averages every TIMING_PERIOD_NS
+    // (tag "LandingTiming"). Only frames that run inference count; the cycle only counts consecutive
+    // frames without a frequency limit (action mode), so idle pauses do not distort it.
+    private val TIMING_PERIOD_NS = 10_000_000_000L
+    private var timingWindowStart = 0L
     private var timingLastStart = 0L
+    private var timingCount = 0
+    private var cycleCount = 0
     private var sumCycle = 0L
     private var sumBitmap = 0L
     private var sumPredict = 0L
@@ -1396,22 +1399,29 @@ class YOLOView @JvmOverloads constructor(
 
     private fun recordTiming(start: Long, bitmapEnd: Long, predictStart: Long, predictEnd: Long,
                              convertNs: Long, end: Long, masks: Int) {
-        if (timingLastStart != 0L) sumCycle += start - timingLastStart
-        timingLastStart = start
+        if (timingWindowStart == 0L) timingWindowStart = start
+        val unlimited = inferenceFrameInterval == null
+        if (unlimited && timingLastStart != 0L) {
+            sumCycle += start - timingLastStart
+            cycleCount++
+        }
+        timingLastStart = if (unlimited) start else 0L
         sumBitmap += bitmapEnd - start
         sumPredict += predictEnd - predictStart
         sumConvert += convertNs
         sumFrame += end - start
         sumMasks += masks
         timingCount++
-        if (timingCount == TIMING_FRAMES) {
-            fun ms(ns: Long) = "%.1f".format(ns / 1e6 / TIMING_FRAMES)
-            val cycleMs = sumCycle / 1e6 / (TIMING_FRAMES - 1).coerceAtLeast(1)
-            Log.i("LandingTiming", "ciclo %.1f ms (%.1f/s) | bitmap ${ms(sumBitmap)} | predict ${ms(sumPredict)} | ".format(cycleMs, 1000 / cycleMs) +
-                "conversione ${ms(sumConvert)} | onFrame ${ms(sumFrame)} | attesa camera %.1f ms | maschere/frame %.1f".format(
-                    cycleMs - sumFrame / 1e6 / TIMING_FRAMES, sumMasks.toDouble() / TIMING_FRAMES))
-            timingCount = 0
+        if (end - timingWindowStart >= TIMING_PERIOD_NS) {
+            val n = timingCount
+            fun ms(ns: Long) = "%.1f".format(ns / 1e6 / n)
+            val cycle = if (cycleCount == 0) "solo riposo" else
+                (sumCycle / 1e6 / cycleCount).let { "ciclo %.1f ms (%.1f/s)".format(it, 1000 / it) }
+            Log.i("LandingTiming", "$n frame | $cycle | bitmap ${ms(sumBitmap)} | predict ${ms(sumPredict)} | " +
+                "conversione ${ms(sumConvert)} | onFrame ${ms(sumFrame)} | maschere/frame %.1f".format(sumMasks.toDouble() / n))
+            timingCount = 0; cycleCount = 0
             sumCycle = 0; sumBitmap = 0; sumPredict = 0; sumConvert = 0; sumFrame = 0; sumMasks = 0
+            timingWindowStart = 0L
             timingLastStart = 0L // the next cycle starts fresh (avoids counting the log time)
         }
     }

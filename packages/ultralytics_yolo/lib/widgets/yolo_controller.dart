@@ -235,6 +235,11 @@ class YOLOViewController {
 
   Future<void> cancelQRCodeScan() => _invoke('cancelQRCodeScan');
 
+  /// [landing_detector] Battery temperature and thermal state (Android only, null elsewhere or
+  /// before the view is ready). Keys: `batteryC`, `thermalStatus` (0-6), `thermalHeadroom`.
+  Future<Map<dynamic, dynamic>?> getThermalInfo() =>
+      _invoke<Map<dynamic, dynamic>>('getThermalInfo');
+
   Future<void> stop() => _invoke('stop');
 
   Future<void> restartCamera() => _invoke('restartCamera');

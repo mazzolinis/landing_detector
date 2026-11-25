@@ -12,8 +12,10 @@ device.
 A frame counts as a landing when the **feet** (bottom part of the mask) of a `carrier_ground`
 overlap the forbidden area. The area is a fixed reference: at startup (and on demand) the app
 calibrates it for 3 s, taking the per-cell median of the network's `forbidden_area` masks, and
-the user confirms it. After that the network no longer changes it. A rolling score (+1 landing frame, −1 otherwise) triggers the
-alarm when it reaches the threshold.
+the user confirms it. After that the network no longer changes it. The area is calibrated again
+when the phone is moved (gyroscope and accelerometer) and whenever the app returns from the
+background. A rolling score (+1 landing frame, −1 otherwise) triggers the alarm when it reaches
+the threshold.
 
 ## Project Status
 
@@ -37,6 +39,14 @@ The project is under active development. Planned milestones:
 flutter pub get
 flutter test              # unit tests of the fault logic (no phone needed)
 flutter run --profile     # on the phone; profile mode is faster than debug
+```
+
+By default the log has three lines per analysed frame. For long tests, use the grouped log: one
+line every 10 s (analysis rate, timings, detections, battery temperature, thermal state) plus
+the main events:
+
+```bash
+flutter run --profile --dart-define=LOG=summary
 ```
 
 ## Model

@@ -41,11 +41,15 @@ Every change is marked with a `[landing_detector]` comment in the sources.
    masks is only painted when the native overlay is visible.
 
 6. **Timing logs** (Android only, for measurements):
-   - Kotlin, tag `LandingTiming`, averages every 30 analysed frames: cycle time, bitmap
-     conversion, `predict`, conversion of the results for Dart, total `onFrame` time, time spent
-     waiting for the camera, masks per frame.
+   - Kotlin, tag `LandingTiming`, averages every 10 s: analysed frames, cycle time (action mode
+     only), bitmap conversion, `predict`, conversion of the results for Dart, total `onFrame` time,
+     masks per frame.
    - Dart (`YOLOView._handleDetectionResults`), printed as `LandingTiming dart`: latency from the
      native send to the Dart side, parsing of the results, time of the app's `onResult`.
+
+7. **Thermal info** (Android only): `YOLOViewController.getThermalInfo()` returns the battery
+   temperature, the Android thermal status (0-6) and the thermal headroom (1.0 = "severe").
+   CPU/GPU temperatures are not accessible to apps.
 
 ## Known caveats
 

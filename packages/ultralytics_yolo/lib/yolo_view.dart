@@ -173,13 +173,14 @@ class _YOLOViewState extends State<YOLOView> {
     }
   }
 
-  // [landing_detector] Dart-side timing, logged as averages every 30 frames ("LandingTiming dart"):
+  // [landing_detector] Dart-side timing, logged as averages every 10 s ("LandingTiming dart"):
   // latency = native send (event['timestamp']) → arrival here; parsing = event → List<YOLOResult>
   // (includes the mask lists); callback = the app's onResult.
   int _tCount = 0;
   int _tLatencyMs = 0;
   int _tParseUs = 0;
   int _tCallbackUs = 0;
+  final Stopwatch _tWindow = Stopwatch()..start();
 
   void _handleDetectionResults(Map<dynamic, dynamic> event) {
     if (widget.onResult == null || !event.containsKey('detections')) return;
@@ -193,10 +194,12 @@ class _YOLOViewState extends State<YOLOView> {
       sw.reset();
       widget.onResult!(results);
       _tCallbackUs += sw.elapsedMicroseconds;
-      if (++_tCount == 30) {
-        debugPrint('LandingTiming dart: latenza ${(_tLatencyMs / 30).toStringAsFixed(1)} ms | '
-            'parsing ${(_tParseUs / 30000).toStringAsFixed(1)} ms | '
-            'onResult app ${(_tCallbackUs / 30000).toStringAsFixed(1)} ms');
+      _tCount++;
+      if (_tWindow.elapsed >= const Duration(seconds: 10)) {
+        debugPrint('LandingTiming dart: latenza ${(_tLatencyMs / _tCount).toStringAsFixed(1)} ms | '
+            'parsing ${(_tParseUs / _tCount / 1000).toStringAsFixed(1)} ms | '
+            'onResult app ${(_tCallbackUs / _tCount / 1000).toStringAsFixed(1)} ms');
+        _tWindow.reset();
         _tCount = 0;
         _tLatencyMs = 0;
         _tParseUs = 0;

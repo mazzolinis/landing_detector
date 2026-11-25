@@ -133,11 +133,12 @@ const double kStrongAccel = 3.0;
 const double kFeetFraction = 0.15;
 
 /// Perché il frame conti come landing, le celle dei piedi nella zona devono essere ALMENO
-/// kFeetMinCells (contro il rumore delle maschere piccole) E almeno kFeetMinFraction del totale
-/// dei piedi (per i giocatori grandi/vicini, dove 3 celle sono una frazione minima).
-/// 0.3 lascia margine al caso "un piede dentro e uno fuori" (~50%).
+/// kFeetMinCells (contro il rumore delle maschere) E almeno kFeetMinFraction del totale dei piedi.
+/// La frazione è disattivata (0): a 0.3 scartava landing veri (piedi al 27–37%) e non distingueva
+/// i falsi (12–39%). Se un giocatore vicino, fermo appena DAVANTI alla zona, risultasse landing per
+/// le caviglie, conviene abbassare kFeetFraction (fascia dei piedi più sottile).
 const int kFeetMinCells = 3;
-const double kFeetMinFraction = 0.3;
+const double kFeetMinFraction = 0;
 
 /// Punteggio mobile: +1 per frame con landing, −1 senza (minimo 0, massimo kScoreMax).
 /// L'allarme suona quando il punteggio RAGGIUNGE kScoreThreshold; poi si "riarma" solo
@@ -147,6 +148,19 @@ const int kScoreThreshold = 3;
 /// Tetto del punteggio: senza, un landing lungo accumulerebbe tanti punti e ci vorrebbe
 /// molto tempo per tornare a 0 e riarmare l'allarme.
 const int kScoreMax = 5;
+
+// ============================================================================================
+// Log
+// ============================================================================================
+
+/// Quantità di log, scelta al lancio (come un -D in C++, senza toccare il codice):
+///   flutter run --profile                             → completo: 3 righe per ogni frame
+///   flutter run --profile --dart-define=LOG=summary   → raggruppato: 1 riga ogni kSummaryPeriod
+///                                                       più gli eventi (righe con ***)
+const bool kFullLog = String.fromEnvironment('LOG', defaultValue: 'full') != 'summary';
+
+/// Ogni quanto si scrive la riga RIEPILOGO (in entrambe le modalità).
+const Duration kSummaryPeriod = Duration(seconds: 10);
 
 /// Classi di cui il plugin costruisce e invia la maschera. Ogni maschera 160x120 costava ~20 ms
 /// per frame; dopo le modifiche al plugin ~1–2 ms (speed_3), ma si chiedono comunque solo quelle
@@ -704,6 +718,69 @@ class LandingLogic {
 }
 
 // ============================================================================================
+// Riepilogo periodico (log raggruppato per i test lunghi)
+// ============================================================================================
+
+/// Accumula i dati dei frame e li riassume in una riga, poi si azzera.
+class LogSummary {
+  int _frames = 0, _ground = 0, _jump = 0, _landing = 0, _alarms = 0;
+  int _timed = 0; // frame di cui si conoscono i tempi (arrivano in una callback separata)
+  double _netSum = 0, _totalSum = 0, _totalMax = 0;
+  double _gyroMax = 0, _accelMax = 0;
+
+  void addFrame(FrameReport r, {required double gyro, required double accel}) {
+    _frames++;
+    if (r.carrier?.className == 'carrier_ground') _ground++;
+    if (r.carrier?.className == 'carrier_jump') _jump++;
+    if (r.landing) _landing++;
+    if (r.alarm) _alarms++;
+    _gyroMax = math.max(_gyroMax, gyro);
+    _accelMax = math.max(_accelMax, accel);
+  }
+
+  void addTiming(double netMs, double totalMs) {
+    _timed++;
+    _netSum += netMs;
+    _totalSum += totalMs;
+    _totalMax = math.max(_totalMax, totalMs);
+  }
+
+  /// Riga di riepilogo dei frame raccolti in [window]; [uptime] = tempo dall'avvio dell'app.
+  String flush({required Duration window, required Duration uptime}) {
+    String f(double v, [int d = 0]) => v.toStringAsFixed(d);
+    final minutes = uptime.inMinutes.toString().padLeft(2, '0');
+    final seconds = (uptime.inSeconds % 60).toString().padLeft(2, '0');
+    final sec = window.inMilliseconds / 1000;
+    final times = _timed == 0
+        ? 'tempi -'
+        : 'rete ${f(_netSum / _timed)} ms, totale ${f(_totalSum / _timed)} ms (max ${f(_totalMax)})';
+    final text = '$minutes:$seconds | $_frames frame (${f(sec > 0 ? _frames / sec : 0, 1)}/s) | $times | '
+        'ground $_ground, jump $_jump, nessuno ${_frames - _ground - _jump} | '
+        'landing $_landing, allarmi $_alarms | gyro max ${f(_gyroMax, 2)}, acc max ${f(_accelMax, 1)}';
+    _frames = _ground = _jump = _landing = _alarms = _timed = 0;
+    _netSum = _totalSum = _totalMax = _gyroMax = _accelMax = 0;
+    return text;
+  }
+}
+
+/// Testo dello stato termico restituito dal plugin (null = non disponibile).
+/// Le app non possono leggere le temperature di CPU e GPU: si vedono quella della batteria, lo
+/// stato termico di Android (da 1 in su il sistema può limitare la velocità) e il "margine"
+/// (1.00 = soglia della limitazione pesante).
+String describeThermal(Map<dynamic, dynamic>? info) {
+  if (info == null || info.isEmpty) return 'temperatura n/d';
+  const names = ['normale', 'leggero', 'moderato', 'severo', 'critico', 'emergenza', 'spegnimento'];
+  final battery = info['batteryC'];
+  final status = info['thermalStatus'];
+  final headroom = info['thermalHeadroom'];
+  return [
+    if (battery is num) 'batteria ${battery.toStringAsFixed(1)} °C',
+    if (status is int) 'termico $status${status >= 0 && status < names.length ? ' (${names[status]})' : ''}',
+    if (headroom is num) 'margine ${headroom.toStringAsFixed(2)}',
+  ].join(', ');
+}
+
+// ============================================================================================
 // Overlay della logica (disegnato da Flutter sopra la camera)
 // ============================================================================================
 
@@ -832,14 +909,22 @@ class _DetectionPageState extends State<DetectionPage> {
   final LandingLogic _logic = LandingLogic();
 
   // --- IMU (giroscopio + accelerometro) ---
-  final MotionMonitor _motion = MotionMonitor();
+  MotionMonitor _motion = MotionMonitor(); // sostituito con uno nuovo quando i sensori ripartono
   StreamSubscription<GyroscopeEvent>? _gyroSub;
   StreamSubscription<UserAccelerometerEvent>? _accelSub;
+  AppLifecycleListener? _lifecycle; // app visibile / in background
 
   // --- Stato mostrato a schermo ---
   FrameReport? _report; // esito dell'ultimo frame
   String _perfText = '';
   String? _modelError;
+
+  // --- Riepilogo periodico e temperatura ---
+  LogSummary _summary = LogSummary();
+  final Stopwatch _uptime = Stopwatch()..start(); // tempo dall'avvio
+  final Stopwatch _summaryWindow = Stopwatch()..start();
+  Timer? _summaryTimer; // callback periodica, come un timer ROS; va cancellata
+  String _thermalText = '';
 
   // --- Misura del ritmo reale di analisi ---
   DateTime? _lastResultAt;
@@ -870,13 +955,61 @@ class _DetectionPageState extends State<DetectionPage> {
     _controller.setShowOverlays(_showRaw);
 
     _startSensors();
+    _startSummary();
+
+    // Ci avvisa quando l'app esce dallo schermo e quando ci torna. onHide/onShow = app davvero non
+    // visibile (Home, altra app, blocco schermo). La tendina delle notifiche o una finestra di
+    // permesso la rendono solo "inattiva": non contano. Va rilasciato in dispose().
+    _lifecycle = AppLifecycleListener(onHide: _onHide, onShow: _onShow);
+  }
+
+  /// App non più visibile: la camera la ferma già il plugin, qui si fermano sensori e riepilogo.
+  void _onHide() {
+    debugPrint('*** APP IN BACKGROUND: sensori fermi ***');
+    _stopSensors();
+    _stopSummary();
+  }
+
+  /// App di nuovo visibile. In background Android può non consegnare i dati dei sensori, quindi non
+  /// si sa se il telefono è stato spostato: la zona si ricalibra SEMPRE (con conferma).
+  void _onShow() {
+    if (_logic.zoneState == ZoneState.gaveUp) {
+      debugPrint('*** RITORNO DAL BACKGROUND: analisi ancora ferma ***');
+      return; // resta ferma finché l'utente non preme "Riprova"
+    }
+    debugPrint('*** RITORNO DAL BACKGROUND: ricalibrazione ***');
+    _startSensors();
+    _startSummary();
+    setState(() => _logic.startCalibration());
+  }
+
+  void _startSummary() {
+    _summary = LogSummary(); // scarta i dati di prima della pausa
+    _summaryWindow.reset();
+    _summaryTimer ??= Timer.periodic(kSummaryPeriod, (_) => _printSummary());
+  }
+
+  void _stopSummary() {
+    _summaryTimer?.cancel();
+    _summaryTimer = null;
+  }
+
+  /// Una riga che riassume gli ultimi kSummaryPeriod. La temperatura si chiede al codice nativo:
+  /// "await" aspetta la risposta senza bloccare l'app (nel frattempo gira il resto).
+  Future<void> _printSummary() async {
+    final text = _summary.flush(window: _summaryWindow.elapsed, uptime: _uptime.elapsed);
+    _summaryWindow.reset();
+    final thermal = describeThermal(await _controller.getThermalInfo());
+    debugPrint('RIEPILOGO $text | zona ${_logic.zoneState.name} | $thermal');
+    if (mounted) setState(() => _thermalText = thermal);
   }
 
   /// Giroscopio e accelerometro a ~50 campioni/s. listen() registra la callback chiamata a ogni
   /// campione (come un subscriber ROS); l'iscrizione va cancellata quando non serve più.
   /// "widget." dà accesso ai parametri del widget (qui useSensors) dall'oggetto State.
   void _startSensors() {
-    if (widget.useSensors) {
+    _motion = MotionMonitor(); // riparte pulito: niente movimenti rimasti in sospeso da prima
+    if (widget.useSensors && _gyroSub == null) {
       _gyroSub = gyroscopeEventStream(samplingPeriod: SensorInterval.gameInterval).listen(
         // e.timestamp = istante della misura (orologio di sistema), più preciso dell'arrivo
         // in Dart, dove i campioni possono arrivare a gruppi.
@@ -904,6 +1037,7 @@ class _DetectionPageState extends State<DetectionPage> {
     debugPrint('*** ANALISI FERMATA: zona non trovata, camera spenta ***');
     _controller.pause();
     _stopSensors();
+    _stopSummary();
     WakelockPlus.disable(); // lo schermo può spegnersi da solo
   }
 
@@ -912,6 +1046,7 @@ class _DetectionPageState extends State<DetectionPage> {
     debugPrint('*** RIPRESA ANALISI (utente) ***');
     WakelockPlus.enable();
     _startSensors();
+    _startSummary();
     _controller.resume();
     setState(() => _logic.startCalibration());
   }
@@ -965,10 +1100,12 @@ class _DetectionPageState extends State<DetectionPage> {
     }
     if (_logic.zoneState == ZoneState.gaveUp && stateBefore != ZoneState.gaveUp) _stopAnalysis();
 
-    debugPrint('frame [${_measuredHz.toStringAsFixed(1)}/s, gyro ${peaks.gyro.toStringAsFixed(2)} rad/s '
-        '${gyroAngle.toStringAsFixed(1)}°/1s, acc ${peaks.accel.toStringAsFixed(1)} m/s²]: '
-        '${results.isEmpty ? '(niente)' : results.map(_describe).join(' | ')}');
-    debugPrint('logica: ${report.describe()}');
+    _summary.addFrame(report, gyro: peaks.gyro, accel: peaks.accel);
+    if (kFullLog) {
+      _logFrame(results, report, peaks.gyro, gyroAngle, peaks.accel);
+    } else if (report.alarm) {
+      debugPrint('*** ALLARME AUTOMATICO: ${report.describe()}');
+    }
 
     if (report.alarm) {
       _autoAlarms++;
@@ -980,6 +1117,14 @@ class _DetectionPageState extends State<DetectionPage> {
 
     if (!mounted) return;
     setState(() => _report = report);
+  }
+
+  /// Log completo di un frame (solo con kFullLog).
+  void _logFrame(List<YOLOResult> results, FrameReport report, double gyro, double angle, double accel) {
+    debugPrint('frame [${_measuredHz.toStringAsFixed(1)}/s, gyro ${gyro.toStringAsFixed(2)} rad/s '
+        '${angle.toStringAsFixed(1)}°/1s, acc ${accel.toStringAsFixed(1)} m/s²]: '
+        '${results.isEmpty ? '(niente)' : results.map(_describe).join(' | ')}');
+    debugPrint('logica: ${report.describe()}');
   }
 
   /// Ritmo reale di analisi: 1 / (tempo dall'ultimo risultato), filtrato con una media mobile.
@@ -1000,10 +1145,10 @@ class _DetectionPageState extends State<DetectionPage> {
     final wantActive = now.difference(_lastCarrierSeen) < kActiveHold;
     final wantZoneMasks = _logic.zoneState == ZoneState.calibrating;
     if (wantActive != _activeMode || wantZoneMasks != _zoneMasksOn) {
-      if (wantActive != _activeMode) {
+      if (kFullLog && wantActive != _activeMode) {
         debugPrint('Frequenza di analisi → ${wantActive ? 'massima (azione)' : '$kIdleHz Hz (riposo)'}');
       }
-      if (wantZoneMasks != _zoneMasksOn) {
+      if (kFullLog && wantZoneMasks != _zoneMasksOn) {
         debugPrint('Maschere di forbidden_area → ${wantZoneMasks ? 'sì (calibrazione)' : 'no'}');
       }
       _activeMode = wantActive;
@@ -1023,8 +1168,11 @@ class _DetectionPageState extends State<DetectionPage> {
   }
 
   void _onPerformance(YOLOPerformanceMetrics m) {
-    debugPrint('tempi: rete ${m.inferenceMs.toStringAsFixed(0)} ms, '
-        'totale ${m.processingTimeMs.toStringAsFixed(0)} ms');
+    _summary.addTiming(m.inferenceMs, m.processingTimeMs);
+    if (kFullLog) {
+      debugPrint('tempi: rete ${m.inferenceMs.toStringAsFixed(0)} ms, '
+          'totale ${m.processingTimeMs.toStringAsFixed(0)} ms');
+    }
     if (!mounted) return;
     setState(() {
       _perfText = 'rete ${m.inferenceMs.toStringAsFixed(0)} ms, '
@@ -1053,6 +1201,8 @@ class _DetectionPageState extends State<DetectionPage> {
 
   @override
   void dispose() {
+    _lifecycle?.dispose();
+    _stopSummary();
     _stopSensors();
     WakelockPlus.disable();
     _player.dispose();
@@ -1121,6 +1271,7 @@ class _DetectionPageState extends State<DetectionPage> {
                     Text(_modelError!, style: const TextStyle(color: Colors.redAccent))
                   else ...[
                     Text('$_perfText | analisi reali ${_measuredHz.toStringAsFixed(1)}/s', style: whiteText),
+                    if (_thermalText.isNotEmpty) Text(_thermalText, style: whiteText),
                     if (report != null) ...[
                       Text(
                         report.carrier == null
