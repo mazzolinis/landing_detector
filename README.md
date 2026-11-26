@@ -26,7 +26,8 @@ The project is under active development. Planned milestones:
 - [✓] Camera preview
 - [✓] Model inference on camera frames
 - [✓] Fault logic (feet/zone overlap and rolling score) with audible alert and debug overlay
-- [ ] Test mode on pre-recorded videos
+- [✓] Replay of recorded videos on the PC (same network and fault logic, no phone)
+- [ ] Analysis of recorded videos inside the app
 
 ## Requirements
 
@@ -49,6 +50,27 @@ the main events:
 ```bash
 flutter run --profile --dart-define=LOG=summary
 ```
+
+## Replay of recorded videos on the PC
+
+Two steps, from the "tchoukball landing project" folder with the Ultralytics venv active:
+
+```bash
+python landing_detector/tool/replay_video.py test_videos/*.mp4      # network → data_logs/replay/*.json
+cd landing_detector
+flutter test tool/replay_test.dart --dart-define=REPLAY=data_logs/replay
+```
+
+The first step runs the same `.tflite` model as the app on the PC, with the same thresholds and
+mask grid, analysing one frame every 45 ms like the phone (`--all-frames` for every frame). The
+second step feeds the detections to the app's `LandingLogic`: the zone is calibrated on the first
+3 s of the video, then the whole video is analysed from the start. It prints the alarms with the
+video time, saves a report next to each JSON and a table in `data_logs/replay/RIEPILOGO.txt`.
+
+Annotations: for `uno.mp4`, the file `data_logs/replay/uno_landing.txt`, one time per line
+(`#` starts a comment): `00:05.0` is a true landing, `? 00:03.7` a difficult moment that is not a
+landing. The report lists detected landings with their delay, alarms on difficult moments and
+other false alarms.
 
 ## Model
 
