@@ -36,7 +36,10 @@ data class YOLOStreamConfig(
 
     // [landing_detector] Classes whose instance masks are built and streamed (null = all).
     // Masks of other classes are skipped entirely: each 160x120 mask cost ~20 ms per frame originally, ~1-2 ms now.
-    val maskClasses: Set<String>? = null
+    val maskClasses: Set<String>? = null,
+
+    // [landing_detector] Write the "LandingTiming" time-budget lines to logcat (diagnostics only).
+    val timingLogs: Boolean = false
     
     // Note: annotatedImage is intentionally excluded for YOLOView
     // YOLOView uses Canvas drawing (real-time overlay), not bitmap generation

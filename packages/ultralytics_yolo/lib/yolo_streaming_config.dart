@@ -134,6 +134,10 @@ class YOLOStreamingConfig {
   /// ~20 ms per detection and frame in the original code, ~1-2 ms now. Only meaningful with [includeMasks].
   final List<String>? maskClasses;
 
+  /// [landing_detector] Print the "LandingTiming" lines (native time budget every 10 s and
+  /// Dart-side latency/parsing). Diagnostics only; off by default.
+  final bool timingLogs;
+
   /// Creates a YOLOStreamingConfig with custom settings.
   ///
   /// This constructor allows full customization of streaming behavior.
@@ -153,6 +157,7 @@ class YOLOStreamingConfig {
     this.skipFrames,
     this.analysisResolution,
     this.maskClasses,
+    this.timingLogs = false,
   });
 
   /// Creates a minimal configuration optimized for maximum performance.
@@ -181,7 +186,8 @@ class YOLOStreamingConfig {
       inferenceFrequency = null,
       skipFrames = null,
       analysisResolution = null,
-      maskClasses = null;
+      maskClasses = null,
+      timingLogs = false;
 
   /// Creates a custom configuration with specified parameters.
   ///
@@ -210,6 +216,7 @@ class YOLOStreamingConfig {
     this.skipFrames,
     this.analysisResolution,
     this.maskClasses,
+    this.timingLogs = false,
   }) : includeDetections = includeDetections ?? true,
        includeClassifications = includeClassifications ?? true,
        includeProcessingTimeMs = includeProcessingTimeMs ?? true,
@@ -239,7 +246,8 @@ class YOLOStreamingConfig {
       inferenceFrequency = null,
       skipFrames = null,
       analysisResolution = null,
-      maskClasses = null;
+      maskClasses = null,
+      timingLogs = false;
 
   /// Creates a configuration with pose keypoints.
   ///
@@ -261,7 +269,8 @@ class YOLOStreamingConfig {
       inferenceFrequency = null,
       skipFrames = null,
       analysisResolution = null,
-      maskClasses = null;
+      maskClasses = null,
+      timingLogs = false;
 
   /// Creates a full configuration with all data included.
   ///
@@ -289,7 +298,8 @@ class YOLOStreamingConfig {
       inferenceFrequency = null,
       skipFrames = null,
       analysisResolution = null,
-      maskClasses = null;
+      maskClasses = null,
+      timingLogs = false;
 
   /// Creates a debug configuration with all data and images.
   ///
@@ -314,7 +324,8 @@ class YOLOStreamingConfig {
       inferenceFrequency = null,
       skipFrames = null,
       analysisResolution = null,
-      maskClasses = null;
+      maskClasses = null,
+      timingLogs = false;
 
   /// Creates a throttled configuration with specified FPS limit.
   ///
@@ -425,6 +436,7 @@ class YOLOStreamingConfig {
         'inferenceFrequency: $inferenceFrequency, '
         'skipFrames: $skipFrames, '
         'analysisResolution: $analysisResolution, '
-        'maskClasses: $maskClasses)';
+        'maskClasses: $maskClasses, '
+        'timingLogs: $timingLogs)';
   }
 }

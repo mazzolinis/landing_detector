@@ -158,7 +158,8 @@ class YOLOPlatformView(
                 analysisWidth = (streamingConfigParam["analysisWidth"] as? Number)?.toInt(),
                 analysisHeight = (streamingConfigParam["analysisHeight"] as? Number)?.toInt(),
                 // [landing_detector]
-                maskClasses = (streamingConfigParam["maskClasses"] as? List<*>)?.filterIsInstance<String>()?.toSet()
+                maskClasses = (streamingConfigParam["maskClasses"] as? List<*>)?.filterIsInstance<String>()?.toSet(),
+                timingLogs = streamingConfigParam["timingLogs"] as? Boolean ?: false
             )
         } else {
             // Create default config when no streaming config is provided
@@ -456,7 +457,8 @@ class YOLOPlatformView(
                             analysisWidth = (configMap["analysisWidth"] as? Number)?.toInt(),
                             analysisHeight = (configMap["analysisHeight"] as? Number)?.toInt(),
                             // [landing_detector]
-                            maskClasses = (configMap["maskClasses"] as? List<*>)?.filterIsInstance<String>()?.toSet()
+                            maskClasses = (configMap["maskClasses"] as? List<*>)?.filterIsInstance<String>()?.toSet(),
+                            timingLogs = configMap["timingLogs"] as? Boolean ?: false
                         )
                         yoloView.setStreamConfig(streamConfig)
                         result.success(null)

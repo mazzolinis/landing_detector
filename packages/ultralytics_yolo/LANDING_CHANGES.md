@@ -40,7 +40,8 @@ Every change is marked with a `[landing_detector]` comment in the sources.
    `BasePredictor.buildOverlayImage` = `YOLOView.showOverlays`): the 640x480 colour image of the
    masks is only painted when the native overlay is visible.
 
-6. **Timing logs** (Android only, for measurements):
+6. **Timing logs** (Android only, for measurements), printed only with the streaming option
+   `timingLogs: true` (Dart `YOLOStreamingConfig.timingLogs`, Kotlin `YOLOStreamConfig.timingLogs`):
    - Kotlin, tag `LandingTiming`, averages every 10 s: analysed frames, cycle time (action mode
      only), bitmap conversion, `predict`, conversion of the results for Dart, total `onFrame` time,
      masks per frame.

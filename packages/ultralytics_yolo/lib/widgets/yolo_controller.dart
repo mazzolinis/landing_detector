@@ -229,6 +229,7 @@ class YOLOViewController {
         'analysisWidth': config.analysisResolution?.width.round(),
         'analysisHeight': config.analysisResolution?.height.round(),
         'maskClasses': config.maskClasses, // [landing_detector]
+        'timingLogs': config.timingLogs, // [landing_detector]
       });
 
   Future<String?> scanQRCode() => _invoke<String>('scanQRCode');

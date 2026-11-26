@@ -196,9 +196,11 @@ class _YOLOViewState extends State<YOLOView> {
       _tCallbackUs += sw.elapsedMicroseconds;
       _tCount++;
       if (_tWindow.elapsed >= const Duration(seconds: 10)) {
-        debugPrint('LandingTiming dart: latenza ${(_tLatencyMs / _tCount).toStringAsFixed(1)} ms | '
+        if (widget.streamingConfig?.timingLogs ?? false) {
+          debugPrint('LandingTiming dart: latenza ${(_tLatencyMs / _tCount).toStringAsFixed(1)} ms | '
             'parsing ${(_tParseUs / _tCount / 1000).toStringAsFixed(1)} ms | '
             'onResult app ${(_tCallbackUs / _tCount / 1000).toStringAsFixed(1)} ms');
+        }
         _tWindow.reset();
         _tCount = 0;
         _tLatencyMs = 0;
@@ -526,6 +528,7 @@ class _YOLOViewState extends State<YOLOView> {
       // [landing_detector]
       final maskClasses = widget.streamingConfig!.maskClasses;
       if (maskClasses != null) streamConfig['maskClasses'] = maskClasses;
+      streamConfig['timingLogs'] = widget.streamingConfig!.timingLogs;
 
       creationParams['streamingConfig'] = streamConfig;
     }

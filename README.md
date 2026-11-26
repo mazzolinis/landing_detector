@@ -43,12 +43,23 @@ flutter test              # unit tests of the fault logic (no phone needed)
 flutter run --profile     # on the phone; profile mode is faster than debug
 ```
 
-By default the log has three lines per analysed frame. For long tests, use the grouped log: one
-line every 10 s (analysis rate, timings, detections, battery temperature, thermal state) plus
-the main events:
+The app opens on a start screen whose choices are saved on the phone:
+
+- **Mode**: *Match* (clean screen, no log file) or *Test* (data collection: the log is always
+  written to a file on the phone, one file per session).
+- **Log** (Test only): *reduced* (one summary line every 10 s with analysis rate, timings,
+  detections, battery temperature and thermal state, plus the main events) or *full* (also three
+  lines per analysed frame). It can be changed during the session from the settings button.
+- **Clip quality** (for the future micro-clips) and **orientation** (landscape, portrait or
+  automatic; landscape and portrait stay locked for the whole session).
+
+Log files: `adb pull /sdcard/Android/data/com.example.landing_detector/files/logs data_logs/phone`.
+
+`flutter run` also prints hundreds of Android and camera messages, mostly at startup. To keep only
+the app's lines:
 
 ```bash
-flutter run --profile --dart-define=LOG=summary
+flutter run --profile 2>&1 | grep --line-buffered -E '^(I/flutter|I/LandingTiming)|^[^A-Z]|^[A-Z][^/]|FAILURE|rror:|Exception' | tee data_logs/test.txt
 ```
 
 ## Replay of recorded videos on the PC

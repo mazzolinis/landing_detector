@@ -31,11 +31,15 @@
 
 import 'dart:async'; // StreamSubscription (l'iscrizione a un flusso di eventi, come un subscriber ROS)
 import 'dart:collection'; // ListQueue: coda a doppia estremità, come std::deque
+import 'dart:io'; // File, Directory, IOSink: scrivere il log su file
 import 'dart:math' as math; // min, max (come <algorithm> in C++)
 import 'dart:typed_data'; // Uint8List/Uint16List: array contigui, come std::vector<uint8_t>
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart'; // SystemChrome, DeviceOrientation: orientamento dello schermo
+import 'package:path_provider/path_provider.dart'; // cartelle dell'app sul telefono
+import 'package:shared_preferences/shared_preferences.dart'; // impostazioni salvate sul telefono
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
@@ -106,8 +110,10 @@ const double kCalibMinSeenFraction = 0.5;
 const int kMaxCalibAttempts = 5;
 const Duration kMaxCalibTime = Duration(seconds: 30);
 
-/// Raggio del pennello per disegnare la zona, in pixel dello schermo (~ mezzo polpastrello).
-const double kBrushRadiusPx = 22;
+/// Raggi del pennello per disegnare la zona (piccolo, medio, grande), in pixel dello schermo.
+/// Prima era uno solo, 22 px: troppo grande, si aggiungeva o cancellava sempre troppo.
+const List<double> kBrushSizesPx = [6, 12, 20];
+const List<String> kBrushSizeNames = ['piccolo', 'medio', 'grande'];
 
 /// Telefono "fermo" = per almeno kStillTime nessun campione "in movimento". Un campione è in
 /// movimento se:
@@ -157,11 +163,13 @@ const int kScoreMax = 5;
 // Log
 // ============================================================================================
 
-/// Quantità di log, scelta al lancio (come un -D in C++, senza toccare il codice):
-///   flutter run --profile                             → completo: 3 righe per ogni frame
-///   flutter run --profile --dart-define=LOG=summary   → raggruppato: 1 riga ogni kSummaryPeriod
-///                                                       più gli eventi (righe con ***)
-const bool kFullLog = String.fromEnvironment('LOG', defaultValue: 'full') != 'summary';
+/// Livello del log in uso, scelto nella schermata iniziale e cambiabile a metà sessione (⚙):
+///   ridotto  → 1 riga RIEPILOGO ogni kSummaryPeriod + gli eventi (righe con ***)
+///   completo → in più 3 righe per ogni frame e i tempi del plugin ("LandingTiming")
+/// È una variabile "static": una sola per tutta l'app, come una variabile globale in C++.
+class LogConfig {
+  static bool full = false;
+}
 
 /// Ogni quanto si scrive la riga RIEPILOGO (in entrambe le modalità).
 const Duration kSummaryPeriod = Duration(seconds: 10);
@@ -182,6 +190,7 @@ YOLOStreamingConfig streamingConfigFor({required bool active, required bool cali
       inferenceFrequency: active ? null : kIdleHz, // null = nessun limite
       analysisResolution: kAnalysisResolution,
       maskClasses: calibrating ? kCalibMaskClasses : kCarrierClasses,
+      timingLogs: LogConfig.full, // le righe "LandingTiming" del plugin solo nel log completo
     );
 
 // ============================================================================================
@@ -950,8 +959,16 @@ class LogicOverlayPainter extends CustomPainter {
   final LandingLogic logic;
   final FrameReport? report;
   final List<Offset> stroke; // bordo che si sta tracciando col dito (coordinate di griglia)
+  final Offset? brushAt; // punto del pennello sotto il dito (coordinate di griglia), se si dipinge
+  final double brushRadiusPx; // raggio del pennello sullo schermo
 
-  LogicOverlayPainter(this.logic, this.report, {this.stroke = const []});
+  LogicOverlayPainter(
+    this.logic,
+    this.report, {
+    this.stroke = const [],
+    this.brushAt,
+    this.brushRadiusPx = 0,
+  });
 
   static final Paint _zoneActivePaint = Paint()..color = Colors.orange.withValues(alpha: 0.35);
   static final Paint _zoneCalibPaint = Paint()..color = Colors.yellow.withValues(alpha: 0.25);
@@ -1020,6 +1037,11 @@ class LogicOverlayPainter extends CustomPainter {
       canvas.drawPath(path, _strokePaint);
     }
 
+    // Pennello: cerchio sotto il dito, per vedere quanto prende.
+    if (brushAt case final b?) {
+      canvas.drawCircle(map.toScreen(b), brushRadiusPx, _strokePaint);
+    }
+
     // 2. Portatore: corpo bianco; se è a terra, fascia dei piedi rossa (nella zona) o azzurra.
     if (!hasMask) return;
     final feetTop = report!.feetTop;
@@ -1042,7 +1064,146 @@ class LogicOverlayPainter extends CustomPainter {
 // Interfaccia
 // ============================================================================================
 
-void main() {
+// ============================================================================================
+// Impostazioni (schermata iniziale) e log su file
+// ============================================================================================
+
+enum AppMode { match, test } // Partita / Test
+
+enum ClipQuality { low, high } // qualità delle micro-clip (le clip arriveranno con un passo futuro)
+
+enum OrientationChoice { landscape, portrait, auto }
+
+/// Le scelte della schermata iniziale, salvate sul telefono (SharedPreferences = un piccolo
+/// archivio chiave → valore dell'app, che resta anche chiudendo l'app).
+class AppSettings {
+  final AppMode mode;
+  final ClipQuality clipQuality;
+  final bool fullLog; // solo in Test
+  final OrientationChoice orientation;
+
+  const AppSettings({
+    this.mode = AppMode.test,
+    this.clipQuality = ClipQuality.low,
+    this.fullLog = false,
+    this.orientation = OrientationChoice.landscape,
+  });
+
+  bool get isTest => mode == AppMode.test;
+
+  /// Copia con alcuni campi cambiati (l'oggetto è immutabile, come una struct const).
+  AppSettings copyWith({
+    AppMode? mode,
+    ClipQuality? clipQuality,
+    bool? fullLog,
+    OrientationChoice? orientation,
+  }) => AppSettings(
+    mode: mode ?? this.mode,
+    clipQuality: clipQuality ?? this.clipQuality,
+    fullLog: fullLog ?? this.fullLog,
+    orientation: orientation ?? this.orientation,
+  );
+
+  /// Orientamenti permessi durante la sessione (vuoto = tutti, cioè "automatico").
+  List<DeviceOrientation> get deviceOrientations => switch (orientation) {
+    OrientationChoice.landscape => [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight],
+    OrientationChoice.portrait => [DeviceOrientation.portraitUp],
+    OrientationChoice.auto => [],
+  };
+
+  String describe() =>
+      'modalità ${isTest ? 'Test' : 'Partita'} | orientamento ${orientation.name} | '
+      'clip ${clipQuality.name} | log ${!isTest
+          ? 'nessuno'
+          : fullLog
+          ? 'completo'
+          : 'ridotto'}';
+
+  /// Gli enum si salvano con il loro nome ("test", "landscape"…); un valore sconosciuto o mancante
+  /// (primo avvio) torna al predefinito.
+  static Future<AppSettings> load() async {
+    final p = await SharedPreferences.getInstance();
+    T pick<T extends Enum>(List<T> values, String key, T fallback) =>
+        values.asNameMap()[p.getString(key)] ?? fallback;
+    const d = AppSettings();
+    return AppSettings(
+      mode: pick(AppMode.values, 'mode', d.mode),
+      clipQuality: pick(ClipQuality.values, 'clipQuality', d.clipQuality),
+      fullLog: p.getBool('fullLog') ?? d.fullLog,
+      orientation: pick(OrientationChoice.values, 'orientation', d.orientation),
+    );
+  }
+
+  Future<void> save() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString('mode', mode.name);
+    await p.setString('clipQuality', clipQuality.name);
+    await p.setBool('fullLog', fullLog);
+    await p.setString('orientation', orientation.name);
+  }
+}
+
+/// Log su file (modalità Test): una sessione = un file, con l'ora su ogni riga.
+/// Cartella: /sdcard/Android/data/com.example.landing_detector/files/logs/ (dal PC:
+/// `adb pull /sdcard/Android/data/com.example.landing_detector/files/logs data_logs/phone`).
+/// Ci finisce tutto ciò che l'app scrive con debugPrint, senza i messaggi di Android.
+class LogFile {
+  static IOSink? _sink;
+  static String? path;
+  static bool _hooked = false;
+
+  static String _two(int v) => v.toString().padLeft(2, '0');
+
+  /// "Aggancia" debugPrint una volta sola: ogni riga va anche nel file, se ce n'è uno aperto.
+  /// debugPrint è una variabile che contiene una funzione: si può sostituire, come un
+  /// puntatore a funzione in C++.
+  static void _hook() {
+    if (_hooked) return;
+    _hooked = true;
+    final original = debugPrint;
+    debugPrint = (String? message, {int? wrapWidth}) {
+      original(message, wrapWidth: wrapWidth);
+      final t = DateTime.now();
+      _sink?.writeln('${_two(t.hour)}:${_two(t.minute)}:${_two(t.second)} ${message ?? ''}');
+    };
+  }
+
+  /// Apre il file di una nuova sessione. Se non ci riesce (es. nei test, dove le cartelle del
+  /// telefono non esistono) lo scrive nel log e prosegue senza file.
+  static Future<void> open(AppSettings settings) async {
+    try {
+      final base = await getExternalStorageDirectory() ?? await getApplicationDocumentsDirectory();
+      final dir = Directory('${base.path}/logs');
+      await dir.create(recursive: true);
+      final now = DateTime.now();
+      final name =
+          'session_${now.year}${_two(now.month)}${_two(now.day)}_'
+          '${_two(now.hour)}${_two(now.minute)}${_two(now.second)}.txt';
+      final file = File('${dir.path}/$name');
+      _hook();
+      _sink = file.openWrite();
+      path = file.path;
+      debugPrint('SESSIONE $name | modello $kModelName | ${settings.describe()}');
+    } catch (e) {
+      debugPrint('Log su file non disponibile: $e');
+    }
+  }
+
+  /// Svuota il buffer sul disco (ogni riepilogo e quando l'app va in background).
+  static Future<void> flush() async => _sink?.flush();
+
+  /// Chiude il file della sessione (ritorno alla schermata iniziale).
+  static Future<void> close() async {
+    final sink = _sink;
+    _sink = null;
+    path = null;
+    await sink?.flush();
+    await sink?.close();
+  }
+}
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized(); // serve prima di usare i plugin
   runApp(const LandingApp());
 }
 
@@ -1060,17 +1221,212 @@ class LandingApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Landing Detector',
-      theme: ThemeData(colorScheme: .fromSeed(seedColor: Colors.orange)),
-      home: DetectionPage(useSensors: useSensors),
+      // Tema scuro: si legge meglio sopra la camera e in palestra.
+      theme: ThemeData(
+        colorScheme: .fromSeed(seedColor: Colors.orange, brightness: Brightness.dark),
+      ),
+      home: StartPage(useSensors: useSensors),
+    );
+  }
+}
+
+// ============================================================================================
+// Schermata iniziale
+// ============================================================================================
+
+/// Si apre a ogni avvio con le ultime scelte già impostate: un tocco su "Avvia" e si parte.
+class StartPage extends StatefulWidget {
+  final bool useSensors;
+
+  const StartPage({super.key, this.useSensors = true});
+
+  @override
+  State<StartPage> createState() => _StartPageState();
+}
+
+class _StartPageState extends State<StartPage> {
+  AppSettings? _settings; // null finché non sono state lette dal telefono
+
+  @override
+  void initState() {
+    super.initState();
+    SystemChrome.setPreferredOrientations([]); // la schermata iniziale gira liberamente
+    // "then": quando la lettura (asincrona) finisce, si aggiorna la schermata.
+    AppSettings.load().then((s) {
+      if (mounted) setState(() => _settings = s);
+    });
+  }
+
+  /// Applica una modifica alle impostazioni ATTUALI (non a una copia vecchia: due tocchi
+  /// ravvicinati, prima che lo schermo si ridisegni, non si annullano a vicenda).
+  void _change(AppSettings Function(AppSettings) update) => setState(() => _settings = update(_settings!));
+
+  /// "Avvia": salva le scelte, apre il log (in Test), blocca l'orientamento e apre la camera.
+  /// Navigator è una pila di schermate: push ne mette una sopra, il "indietro" la toglie.
+  /// "await" su push aspetta che la schermata della camera venga chiusa.
+  Future<void> _start() async {
+    final s = _settings!;
+    await s.save();
+    LogConfig.full = s.isTest && s.fullLog;
+    if (s.isTest) await LogFile.open(s);
+    // Senza "await": l'orientamento si applica da solo, non serve aspettare la risposta di Android.
+    // "unawaited" dice esplicitamente che non aspettiamo questo Future (una promessa di risultato).
+    unawaited(SystemChrome.setPreferredOrientations(s.deviceOrientations));
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => DetectionPage(settings: s, useSensors: widget.useSensors),
+      ),
+    );
+    // Ritorno alla schermata iniziale: fine della sessione.
+    debugPrint('*** FINE SESSIONE ***');
+    await LogFile.close();
+    unawaited(SystemChrome.setPreferredOrientations([]));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = _settings;
+    if (s == null) return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    final theme = Theme.of(context);
+
+    final title = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text('Tchoukball Landing', style: theme.textTheme.headlineMedium),
+        Text('modello $kModelName', style: theme.textTheme.bodySmall),
+      ],
+    );
+    final startButton = FilledButton.icon(
+      onPressed: _start,
+      icon: const Icon(Icons.play_arrow, size: 32),
+      label: const Text('AVVIA', style: TextStyle(fontSize: 22)),
+      style: FilledButton.styleFrom(minimumSize: const Size(220, 64)),
+    );
+
+    // Le opzioni: una riga per scelta. SegmentedButton = pulsanti affiancati, uno selezionato.
+    Widget option<T>(
+      String label,
+      String? help,
+      T value,
+      List<(T, String)> choices,
+      void Function(T) onChanged, {
+      Set<T> disabled = const {},
+    }) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(label, style: theme.textTheme.titleMedium),
+            const SizedBox(height: 4),
+            SegmentedButton<T>(
+              segments: [
+                for (final (v, text) in choices)
+                  ButtonSegment(value: v, label: Text(text), enabled: !disabled.contains(v)),
+              ],
+              selected: {value},
+              onSelectionChanged: (sel) => onChanged(sel.first),
+              showSelectedIcon: false,
+            ),
+            if (help != null) Text(help, style: theme.textTheme.bodySmall),
+          ],
+        ),
+      );
+    }
+
+    final options = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        option(
+          'Modalità',
+          s.isTest
+              ? 'Raccoglie dati: log su file, contatori, pulsante "segna landing"'
+              : 'Schermo pulito, nessun log',
+          s.mode,
+          const [(AppMode.match, 'Partita'), (AppMode.test, 'Test')],
+          (v) => _change((cur) => cur.copyWith(mode: v)),
+        ),
+        if (s.isTest)
+          option(
+            'Log',
+            s.fullLog ? 'Una riga per ogni frame (file grandi)' : 'Un riepilogo ogni 10 s più gli eventi',
+            s.fullLog,
+            const [(false, 'Ridotto'), (true, 'Completo')],
+            (v) => _change((cur) => cur.copyWith(fullLog: v)),
+          ),
+        option(
+          'Qualità clip',
+          'Le clip arriveranno con un prossimo passo',
+          s.clipQuality,
+          const [(ClipQuality.low, 'Bassa'), (ClipQuality.high, 'Alta')],
+          (v) => _change((cur) => cur.copyWith(clipQuality: v)),
+          disabled: const {ClipQuality.high},
+        ),
+        option('Orientamento', 'Bloccato per tutta la sessione, tranne "Automatico"', s.orientation, const [
+          (OrientationChoice.landscape, 'Orizzontale'),
+          (OrientationChoice.portrait, 'Verticale'),
+          (OrientationChoice.auto, 'Automatico'),
+        ], (v) => _change((cur) => cur.copyWith(orientation: v))),
+      ],
+    );
+
+    // Stessi pezzi, disposti in base all'orientamento: in orizzontale opzioni a sinistra, titolo e
+    // "Avvia" a destra; in verticale tutto in colonna. SingleChildScrollView: se lo schermo è
+    // piccolo si scorre invece di tagliare il contenuto.
+    return Scaffold(
+      body: SafeArea(
+        child: OrientationBuilder(
+          builder: (context, orientation) => orientation == Orientation.landscape
+              ? Row(
+                  children: [
+                    Expanded(
+                      flex: 2,
+                      child: SingleChildScrollView(padding: const EdgeInsets.all(16), child: options),
+                    ),
+                    Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [title, startButton],
+                        ),
+                      ),
+                    ),
+                  ],
+                )
+              : SingleChildScrollView(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      title,
+                      const SizedBox(height: 24),
+                      options,
+                      const SizedBox(height: 32),
+                      Center(child: startButton),
+                    ],
+                  ),
+                ),
+        ),
+      ),
     );
   }
 }
 
 /// Schermata principale: camera + rete neurale + logica del fallo.
 class DetectionPage extends StatefulWidget {
+  final AppSettings settings;
   final bool useSensors;
 
-  const DetectionPage({super.key, this.useSensors = true});
+  /// Solo per i test: una logica già preparata (es. con la zona proposta), per controllare la
+  /// schermata in ogni stato senza camera.
+  final LandingLogic? logic;
+
+  const DetectionPage({super.key, this.settings = const AppSettings(), this.useSensors = true, this.logic});
 
   @override
   State<DetectionPage> createState() => _DetectionPageState();
@@ -1078,7 +1434,8 @@ class DetectionPage extends StatefulWidget {
 
 class _DetectionPageState extends State<DetectionPage> {
   final YOLOViewController _controller = YOLOViewController();
-  final LandingLogic _logic = LandingLogic();
+  // "late": inizializzata al primo uso, quando "widget" è già disponibile.
+  late final LandingLogic _logic = widget.logic ?? LandingLogic();
 
   // --- IMU (giroscopio + accelerometro) ---
   MotionMonitor _motion = MotionMonitor(); // sostituito con uno nuovo quando i sensori ripartono
@@ -1097,6 +1454,12 @@ class _DetectionPageState extends State<DetectionPage> {
   final Stopwatch _summaryWindow = Stopwatch()..start();
   Timer? _summaryTimer; // callback periodica, come un timer ROS; va cancellata
   String _thermalText = '';
+  Map<dynamic, dynamic>? _thermalInfo; // ultima lettura grezza (per decidere se il telefono scotta)
+
+  // --- Schermata dal vivo ---
+  bool _showDetails = false; // pannello dettagli aperto (toccando la pillola, solo in Test)
+  bool _alarmFlash = false; // bordo rosso acceso (lampeggia per qualche istante dopo un allarme)
+  Timer? _alarmFlashTimer;
 
   // --- Misura del ritmo reale di analisi ---
   DateTime? _lastResultAt;
@@ -1120,14 +1483,19 @@ class _DetectionPageState extends State<DetectionPage> {
 
   // --- Disegno a mano della zona ---
   BrushTool _tool = BrushTool.trace;
+  int _brushSize = 1; // indice in kBrushSizesPx (0 piccolo, 1 medio, 2 grande)
   List<Offset> _stroke = []; // bordo in corso (Traccia), coordinate di griglia
   Offset? _lastBrush; // ultimo punto del pennello (Aggiungi/Cancella), coordinate di griglia
 
   @override
   void initState() {
     super.initState();
+    debugPrint('*** INIZIO SESSIONE: ${widget.settings.describe()} ***');
     // Tiene lo schermo acceso: senza, Android lo spegne, l'app va in pausa e la camera si chiude.
     WakelockPlus.enable();
+    // Tutto schermo, come l'app fotocamera: le barre di Android si riaprono scorrendo dal bordo
+    // e si richiudono da sole ("immersiveSticky").
+    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky));
     // Il controller ricorda l'impostazione anche se la vista nativa non è ancora pronta.
     _controller.setShowOverlays(_showRaw);
 
@@ -1143,6 +1511,7 @@ class _DetectionPageState extends State<DetectionPage> {
   /// App non più visibile: la camera la ferma già il plugin, qui si fermano sensori e riepilogo.
   void _onHide() {
     debugPrint('*** APP IN BACKGROUND: sensori fermi ***');
+    LogFile.flush();
     _stopSensors();
     _stopSummary();
   }
@@ -1176,9 +1545,16 @@ class _DetectionPageState extends State<DetectionPage> {
   Future<void> _printSummary() async {
     final text = _summary.flush(window: _summaryWindow.elapsed, uptime: _uptime.elapsed);
     _summaryWindow.reset();
-    final thermal = describeThermal(await _controller.getThermalInfo());
+    final info = await _controller.getThermalInfo();
+    final thermal = describeThermal(info);
     debugPrint('RIEPILOGO $text | zona ${_logic.zoneState.name} | $thermal');
-    if (mounted) setState(() => _thermalText = thermal);
+    LogFile.flush();
+    if (mounted) {
+      setState(() {
+        _thermalText = thermal;
+        _thermalInfo = info;
+      });
+    }
   }
 
   /// Giroscopio e accelerometro a ~50 campioni/s. listen() registra la callback chiamata a ogni
@@ -1275,7 +1651,7 @@ class _DetectionPageState extends State<DetectionPage> {
         _stroke = [g];
       } else {
         _lastBrush = g;
-        _logic.brush(g, g, kBrushRadiusPx / map.scale, add: _tool == BrushTool.add);
+        _logic.brush(g, g, kBrushSizesPx[_brushSize] / map.scale, add: _tool == BrushTool.add);
       }
     });
   }
@@ -1287,7 +1663,7 @@ class _DetectionPageState extends State<DetectionPage> {
         // Un punto ogni ~mezza cella basta e tiene il bordo leggero.
         if (_stroke.isEmpty || (_stroke.last - g).distance >= 0.5) _stroke = [..._stroke, g];
       } else {
-        _logic.brush(_lastBrush ?? g, g, kBrushRadiusPx / map.scale, add: _tool == BrushTool.add);
+        _logic.brush(_lastBrush ?? g, g, kBrushSizesPx[_brushSize] / map.scale, add: _tool == BrushTool.add);
         _lastBrush = g;
       }
     });
@@ -1303,6 +1679,61 @@ class _DetectionPageState extends State<DetectionPage> {
       _stroke = [];
       _lastBrush = null;
     });
+  }
+
+  /// ⚙: impostazioni durante la sessione. In Test si può passare al log completo (es. si è visto
+  /// un bug) e tornare al ridotto; nel file resta la riga del cambio.
+  void _openSettings() {
+    // showModalBottomSheet: un pannello che sale dal basso. StatefulBuilder gli dà un suo
+    // setState, perché il pannello non fa parte di questa schermata.
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setSheetState) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(widget.settings.describe()),
+                if (LogFile.path != null) Text('file: ${LogFile.path!.split('/').last}'),
+                const SizedBox(height: 8),
+                if (widget.settings.isTest)
+                  SwitchListTile(
+                    title: const Text('Log completo'),
+                    subtitle: const Text('Una riga per ogni frame, da qui in avanti'),
+                    value: LogConfig.full,
+                    onChanged: (v) {
+                      setSheetState(() => _setFullLog(v));
+                    },
+                  )
+                else
+                  const Text('In modalità Partita il log non viene salvato.'),
+                const SizedBox(height: 12),
+                // Senza barra in alto non c'è la freccia "indietro" (resta il gesto di Android).
+                OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.of(context).pop(); // chiude il pannello
+                    Navigator.of(this.context).pop(); // chiude la camera → schermata iniziale
+                  },
+                  icon: const Icon(Icons.stop),
+                  label: const Text('Termina sessione'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _setFullLog(bool full) {
+    if (LogConfig.full == full) return;
+    LogConfig.full = full;
+    debugPrint('*** LOG → ${full ? 'completo' : 'ridotto'} ***');
+    // I tempi del plugin ("LandingTiming") seguono il livello del log.
+    _controller.setStreamingConfig(streamingConfigFor(active: _activeMode, calibrating: _zoneMasksOn));
   }
 
   void _toggleRaw() {
@@ -1359,7 +1790,7 @@ class _DetectionPageState extends State<DetectionPage> {
     if (_logic.zoneState == ZoneState.gaveUp && stateBefore != ZoneState.gaveUp) _stopAnalysis();
 
     _summary.addFrame(report, gyro: peaks.gyro, accel: peaks.accel);
-    if (kFullLog) {
+    if (LogConfig.full) {
       _logFrame(results, report, peaks.gyro, gyroAngle, peaks.accel);
     } else if (report.alarm) {
       debugPrint('*** ALLARME AUTOMATICO: ${report.describe()}');
@@ -1368,6 +1799,7 @@ class _DetectionPageState extends State<DetectionPage> {
     if (report.alarm) {
       _autoAlarms++;
       _playAlarm();
+      _flashAlarm();
     }
 
     // In calibrazione si analizza al massimo ritmo: più frame = mediana più affidabile.
@@ -1377,7 +1809,7 @@ class _DetectionPageState extends State<DetectionPage> {
     setState(() => _report = report);
   }
 
-  /// Log completo di un frame (solo con kFullLog).
+  /// Log completo di un frame (solo con LogConfig.full).
   void _logFrame(List<YOLOResult> results, FrameReport report, double gyro, double angle, double accel) {
     debugPrint(
       'frame [${_measuredHz.toStringAsFixed(1)}/s, gyro ${gyro.toStringAsFixed(2)} rad/s '
@@ -1407,10 +1839,10 @@ class _DetectionPageState extends State<DetectionPage> {
         _logic.zoneState != ZoneState.editing && now.difference(_lastCarrierSeen) < kActiveHold;
     final wantZoneMasks = _logic.zoneState == ZoneState.calibrating;
     if (wantActive != _activeMode || wantZoneMasks != _zoneMasksOn) {
-      if (kFullLog && wantActive != _activeMode) {
+      if (LogConfig.full && wantActive != _activeMode) {
         debugPrint('Frequenza di analisi → ${wantActive ? 'massima (azione)' : '$kIdleHz Hz (riposo)'}');
       }
-      if (kFullLog && wantZoneMasks != _zoneMasksOn) {
+      if (LogConfig.full && wantZoneMasks != _zoneMasksOn) {
         debugPrint('Maschere di forbidden_area → ${wantZoneMasks ? 'sì (calibrazione)' : 'no'}');
       }
       _activeMode = wantActive;
@@ -1431,7 +1863,7 @@ class _DetectionPageState extends State<DetectionPage> {
 
   void _onPerformance(YOLOPerformanceMetrics m) {
     _summary.addTiming(m.inferenceMs, m.processingTimeMs);
-    if (kFullLog) {
+    if (LogConfig.full) {
       debugPrint(
         'tempi: rete ${m.inferenceMs.toStringAsFixed(0)} ms, '
         'totale ${m.processingTimeMs.toStringAsFixed(0)} ms',
@@ -1458,6 +1890,27 @@ class _DetectionPageState extends State<DetectionPage> {
     _playAlarm();
   }
 
+  /// Bordo rosso lampeggiante per ~1.5 s dopo un allarme (6 cambi ogni 250 ms).
+  void _flashAlarm() {
+    _alarmFlashTimer?.cancel();
+    var ticks = 0;
+    setState(() => _alarmFlash = true);
+    _alarmFlashTimer = Timer.periodic(const Duration(milliseconds: 250), (t) {
+      ticks++;
+      if (!mounted) return t.cancel();
+      setState(() => _alarmFlash = ticks < 6 && !_alarmFlash);
+      if (ticks >= 6) t.cancel();
+    });
+  }
+
+  /// Il telefono si sta scaldando troppo: stato termico Android "moderato" o peggio, oppure
+  /// margine vicino alla soglia della limitazione pesante.
+  bool get _phoneHot {
+    final status = _thermalInfo?['thermalStatus'];
+    final headroom = _thermalInfo?['thermalHeadroom'];
+    return (status is int && status >= 2) || (headroom is num && headroom >= 0.9);
+  }
+
   Future<void> _playAlarm() async {
     await _player.stop();
     await _player.play(AssetSource('sounds/alarm.wav'));
@@ -1466,6 +1919,8 @@ class _DetectionPageState extends State<DetectionPage> {
 
   @override
   void dispose() {
+    _alarmFlashTimer?.cancel();
+    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge)); // barre di nuovo visibili
     _lifecycle?.dispose();
     _stopSummary();
     _stopSensors();
@@ -1474,89 +1929,19 @@ class _DetectionPageState extends State<DetectionPage> {
     super.dispose();
   }
 
-  /// Barra in basso durante il disegno: istruzioni, scelta dello strumento, Annulla/Conferma.
-  Widget _drawingToolbar() {
-    final hint = switch (_tool) {
-      BrushTool.trace => 'Disegna col dito il bordo della zona: si chiude e si riempie da solo',
-      BrushTool.add => 'Passa il dito per aggiungere celle alla zona',
-      BrushTool.erase => 'Passa il dito per cancellare celle dalla zona',
-    };
-    return Container(
-      color: Colors.black54,
-      padding: const EdgeInsets.all(8),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            '$hint · ${_logic.displayZoneCells} celle',
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: Colors.white),
-          ),
-          const SizedBox(height: 8),
-          // SegmentedButton: pulsanti affiancati di cui uno solo è selezionato (come dei "radio").
-          SegmentedButton<BrushTool>(
-            segments: const [
-              ButtonSegment(value: BrushTool.trace, icon: Icon(Icons.gesture), label: Text('Traccia bordo')),
-              ButtonSegment(value: BrushTool.add, icon: Icon(Icons.brush), label: Text('Aggiungi')),
-              ButtonSegment(
-                value: BrushTool.erase,
-                icon: Icon(Icons.auto_fix_normal),
-                label: Text('Cancella'),
-              ),
-            ],
-            selected: {_tool}, // un "Set" con l'elemento selezionato
-            onSelectionChanged: (s) => setState(() => _tool = s.first),
-            style: SegmentedButton.styleFrom(backgroundColor: Colors.white70),
-          ),
-          const SizedBox(height: 8),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              OutlinedButton.icon(
-                onPressed: _onCancelDrawing,
-                icon: const Icon(Icons.close),
-                label: const Text('Annulla'),
-                style: OutlinedButton.styleFrom(foregroundColor: Colors.white),
-              ),
-              const SizedBox(width: 12),
-              FilledButton.icon(
-                onPressed: _onConfirmDrawing,
-                icon: const Icon(Icons.check),
-                label: const Text('Conferma'),
-                style: FilledButton.styleFrom(backgroundColor: Colors.green),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
+  // ------------------------------------------------------------------------------------------
+  // Schermata dal vivo: camera a tutto schermo, pillola di stato, comandi su un bordo.
+  // Stessi pezzi in verticale e in orizzontale: cambia solo dove vengono messi.
+  // ------------------------------------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
-    const whiteText = TextStyle(color: Colors.white, fontSize: 14);
     final report = _report;
     final editing = _logic.zoneState == ZoneState.editing;
+    final landscape = MediaQuery.orientationOf(context) == Orientation.landscape;
 
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: AppBar(
-        title: const Text('Landing Detector'),
-        // "actions": pulsanti a destra nella barra in alto.
-        actions: [
-          IconButton(
-            tooltip: _showRaw ? 'Nascondi rilevamenti grezzi' : 'Mostra rilevamenti grezzi',
-            icon: Icon(_showRaw ? Icons.visibility : Icons.visibility_off),
-            onPressed: _toggleRaw,
-          ),
-          IconButton(
-            tooltip: 'Disegna zona',
-            icon: const Icon(Icons.brush),
-            onPressed: editing ? null : _onStartDrawing, // null = pulsante disattivato
-          ),
-          IconButton(tooltip: 'Ricalibra zona', icon: const Icon(Icons.refresh), onPressed: _onRecalibrate),
-        ],
-      ),
       body: Stack(
         children: [
           // Livello 1: camera + rete (se _showRaw, il plugin disegna anche box e maschere grezzi).
@@ -1580,7 +1965,13 @@ class _DetectionPageState extends State<DetectionPage> {
               builder: (context, constraints) {
                 final paint = CustomPaint(
                   size: constraints.biggest,
-                  painter: LogicOverlayPainter(_logic, report, stroke: _stroke),
+                  painter: LogicOverlayPainter(
+                    _logic,
+                    report,
+                    stroke: _stroke,
+                    brushAt: _tool == BrushTool.trace ? null : _lastBrush,
+                    brushRadiusPx: kBrushSizesPx[_brushSize],
+                  ),
                 );
                 if (!editing) return IgnorePointer(child: paint);
                 final map = GridMapping.fit(constraints.biggest, _logic.gridW, _logic.gridH);
@@ -1597,145 +1988,279 @@ class _DetectionPageState extends State<DetectionPage> {
             ),
           ),
 
-          // Livello 3: pannello con lo stato della logica (nascosto mentre si disegna, per lasciare
-          // libera l'immagine).
-          if (!editing)
-            Positioned(
-              left: 8,
-              right: 8,
-              top: 8,
-              child: Container(
-                padding: const EdgeInsets.all(8),
-                // Sfondo rosso se il frame corrente è un landing, altrimenti nero semitrasparente.
-                color: (report?.landing ?? false) ? Colors.red.withValues(alpha: 0.7) : Colors.black54,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (_modelError != null)
-                      Text(_modelError!, style: const TextStyle(color: Colors.redAccent))
-                    else ...[
-                      Text(
-                        '$_perfText | analisi reali ${_measuredHz.toStringAsFixed(1)}/s',
-                        style: whiteText,
-                      ),
-                      if (_thermalText.isNotEmpty) Text(_thermalText, style: whiteText),
-                      if (report != null) ...[
-                        Text(
-                          report.carrier == null
-                              ? 'portatore: nessuno'
-                              : 'portatore: ${report.carrier!.className} '
-                                    '${report.carrier!.confidence.toStringAsFixed(2)}',
-                          style: whiteText,
-                        ),
-                        Text(
-                          'piedi nella zona: ${report.feetInZone}/${report.feetCells} celle '
-                          '(${report.feetPercent}%)',
-                          style: whiteText,
-                        ),
-                        if (!report.still)
-                          Text(
-                            'telefono in movimento: rilevamento in pausa',
-                            style: whiteText.copyWith(color: Colors.yellow),
-                          ),
-                        Text(
-                          report.zoneText,
-                          style: whiteText.copyWith(
-                            color: report.zoneState == ZoneState.active ? Colors.white : Colors.yellow,
-                          ),
-                        ),
-                        Text(
-                          'punteggio: ${report.score}   (allarme a $kScoreThreshold)',
-                          style: whiteText.copyWith(fontSize: 20, fontWeight: FontWeight.bold),
-                        ),
-                      ],
-                      const Text(
-                        'zona: gialla = calibrazione/proposta, arancio = attiva · '
-                        'bianco = portatore · piedi: rosso = nella zona, azzurro = fuori',
-                        style: TextStyle(color: Colors.white70, fontSize: 11),
-                      ),
-                    ],
-                  ],
+          // Livello 3: bordo rosso lampeggiante dopo un allarme.
+          if (_alarmFlash)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: Container(
+                  decoration: BoxDecoration(border: Border.all(color: Colors.red, width: 14)),
                 ),
               ),
             ),
 
-          // Livello 4 (disegno): strumenti del pennello.
-          if (editing) Positioned(left: 0, right: 0, bottom: 16, child: _drawingToolbar()),
+          // Livello 4: tutto ciò che sta sopra l'immagine, dentro l'area sicura (SafeArea: lontano
+          // da notch e angoli arrotondati).
+          SafeArea(
+            child: Stack(
+              children: [
+                // Pillola di stato (e pannello dettagli) in alto a sinistra.
+                Positioned(left: 12, top: 12, right: landscape ? 120 : 12, child: _statusArea(report)),
 
-          // Livello 4: pulsante per segnare manualmente un landing e contatori.
-          if (!editing)
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 24,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  // Analisi ferma: messaggio e pulsante per riaccendere.
-                  if (_logic.zoneState == ZoneState.gaveUp) ...[
-                    const Text(
-                      'Zona non trovata: analisi ferma',
-                      style: TextStyle(color: Colors.yellow, fontSize: 18),
-                    ),
-                    const SizedBox(height: 4),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        FilledButton.icon(
-                          onPressed: _resumeAnalysis,
-                          icon: const Icon(Icons.play_arrow),
-                          label: const Text('Riprova'),
-                        ),
-                        const SizedBox(width: 12),
-                        FilledButton.icon(
-                          onPressed: _onStartDrawing,
-                          icon: const Icon(Icons.brush),
-                          label: const Text('Disegna a mano'),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                  ],
-                  // Pulsanti della zona: compaiono solo quando servono ("collection if").
-                  if (_logic.zoneState == ZoneState.proposal)
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        FilledButton.icon(
-                          onPressed: _onConfirmZone,
-                          icon: const Icon(Icons.check),
-                          label: const Text('Conferma zona'),
-                          style: FilledButton.styleFrom(backgroundColor: Colors.green),
-                        ),
-                        const SizedBox(width: 8),
-                        FilledButton.icon(
-                          onPressed: _onStartDrawing,
-                          icon: const Icon(Icons.brush),
-                          label: const Text('Correggi'),
-                        ),
-                        const SizedBox(width: 8),
-                        FilledButton.icon(
-                          onPressed: _onRecalibrate,
-                          icon: const Icon(Icons.refresh),
-                          label: const Text('Ricalibra'),
-                        ),
-                      ],
-                    ),
-                  const SizedBox(height: 12),
-                  FilledButton.icon(
-                    onPressed: _onManualPressed,
-                    icon: const Icon(Icons.campaign, size: 32),
-                    label: const Text('LANDING!', style: TextStyle(fontSize: 24)),
-                    style: FilledButton.styleFrom(backgroundColor: Colors.red),
+                // Messaggio breve al centro (calibrazione, analisi ferma, errore del modello).
+                if (_centerMessage() case final message?)
+                  Align(alignment: const Alignment(0, -0.35), child: _messageBox(message)),
+
+                // Comandi: colonna a destra (orizzontale) o riga in basso (verticale). Durante il
+                // disegno diventano gli strumenti del pennello.
+                landscape
+                    ? Positioned(right: 12, top: 0, bottom: 0, child: Center(child: _commands(Axis.vertical)))
+                    : Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: 16,
+                        child: Center(child: _commands(Axis.horizontal)),
+                      ),
+
+                // Contatori in basso a sinistra (solo Test).
+                if (widget.settings.isTest && !editing)
+                  Positioned(
+                    left: 12,
+                    bottom: landscape ? 12 : 96,
+                    child: _messageBox('allarmi $_autoAlarms · segnati $_manualAlarms', small: true),
                   ),
-                  const SizedBox(height: 8),
-                  Text('Allarmi automatici: $_autoAlarms   manuali: $_manualAlarms', style: whiteText),
-                ],
-              ),
+              ],
             ),
+          ),
         ],
       ),
     );
+  }
+
+  /// Etichetta e colore dello stato della zona, per la pillola.
+  (String, Color) _zoneLabel() => switch (_logic.zoneState) {
+    ZoneState.active => ('ZONA ATTIVA', Colors.greenAccent),
+    ZoneState.calibrating => ('CALIBRAZIONE', Colors.yellow),
+    ZoneState.proposal => ('ZONA DA CONFERMARE', Colors.yellow),
+    ZoneState.editing => ('DISEGNO ZONA', Colors.lightGreenAccent),
+    ZoneState.gaveUp => ('ANALISI FERMA', Colors.grey),
+  };
+
+  /// Pillola: pallino colorato + stato della zona; in Test anche ritmo e temperatura.
+  /// In Test toccandola si apre/chiude il pannello dei dettagli.
+  Widget _statusArea(FrameReport? report) {
+    final (label, color) = _zoneLabel(); // "record": due valori restituiti insieme
+    final battery = _thermalInfo?['batteryC'];
+    final parts = [
+      label,
+      if (widget.settings.isTest) '${_measuredHz.toStringAsFixed(0)}/s',
+      if (battery is num && (widget.settings.isTest || _phoneHot)) '${battery.toStringAsFixed(0)}°C',
+      if (_phoneHot) 'CALDO',
+      if (report != null && !report.still && _logic.zoneState != ZoneState.editing) 'in movimento',
+      if (_logic.zoneState == ZoneState.editing) ...[
+        '${_logic.displayZoneCells} celle',
+        switch (_tool) {
+          BrushTool.trace => 'traccia il bordo',
+          BrushTool.add => 'aggiungi',
+          BrushTool.erase => 'cancella',
+        },
+      ],
+    ];
+    final landingNow = report?.landing ?? false;
+    final pill = GestureDetector(
+      onTap: widget.settings.isTest ? () => setState(() => _showDetails = !_showDetails) : null,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: landingNow ? Colors.red.withValues(alpha: 0.8) : Colors.black54,
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.circle, size: 12, color: color),
+            const SizedBox(width: 8),
+            // Flexible: se il testo è più largo dello spazio va a capo invece di uscire dallo schermo.
+            Flexible(
+              child: Text(parts.join(' · '), style: const TextStyle(color: Colors.white, fontSize: 14)),
+            ),
+            if (widget.settings.isTest) ...[
+              const SizedBox(width: 4),
+              Icon(_showDetails ? Icons.expand_less : Icons.expand_more, size: 18, color: Colors.white70),
+            ],
+          ],
+        ),
+      ),
+    );
+    if (!(_showDetails && widget.settings.isTest)) return Align(alignment: Alignment.topLeft, child: pill);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [pill, const SizedBox(height: 6), _detailsPanel(report)],
+    );
+  }
+
+  /// Pannello dei dettagli (quello che prima stava sempre in alto): solo in Test, a richiesta.
+  Widget _detailsPanel(FrameReport? report) {
+    const text = TextStyle(color: Colors.white, fontSize: 13);
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 460),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(8)),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text('$_perfText | analisi reali ${_measuredHz.toStringAsFixed(1)}/s', style: text),
+          if (_thermalText.isNotEmpty) Text(_thermalText, style: text),
+          if (report != null) ...[
+            Text(
+              report.carrier == null
+                  ? 'portatore: nessuno'
+                  : 'portatore: ${report.carrier!.className} ${report.carrier!.confidence.toStringAsFixed(2)}',
+              style: text,
+            ),
+            Text(
+              'piedi nella zona: ${report.feetInZone}/${report.feetCells} celle (${report.feetPercent}%)',
+              style: text,
+            ),
+            Text(report.zoneText, style: text),
+            Text(
+              'punteggio: ${report.score}   (allarme a $kScoreThreshold)',
+              style: text.copyWith(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+          ],
+          const Text(
+            'zona: gialla = calibrazione/proposta, arancio = attiva · bianco = portatore · '
+            'piedi: rosso = nella zona, azzurro = fuori',
+            style: TextStyle(color: Colors.white70, fontSize: 11),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Messaggio al centro, se serve (null = nessun messaggio). "switch" con condizioni ("when").
+  String? _centerMessage() {
+    if (_modelError != null) return _modelError;
+    final waiting = _logic.zoneText.contains('attesa');
+    return switch (_logic.zoneState) {
+      ZoneState.calibrating when waiting => 'Calibrazione: tieni fermo il telefono',
+      ZoneState.calibrating => 'Calibrazione della zona…',
+      ZoneState.gaveUp => 'Zona non trovata: ▶ riprova · ✏ disegna a mano',
+      ZoneState.proposal => 'Zona proposta: ✓ conferma · ✕ ricalibra · ✏ correggi',
+      _ => null,
+    };
+  }
+
+  Widget _messageBox(String text, {bool small = false}) => Container(
+    padding: EdgeInsets.symmetric(horizontal: small ? 10 : 16, vertical: small ? 4 : 10),
+    decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(12)),
+    child: Text(
+      text,
+      style: TextStyle(color: Colors.white, fontSize: small ? 13 : 17),
+    ),
+  );
+
+  /// Pulsante rotondo semitrasparente con un'icona. [big] = scelta importante (conferma zona…).
+  Widget _roundButton(
+    IconData icon,
+    String tooltip,
+    VoidCallback onPressed, {
+    Color? color,
+    bool big = false,
+  }) => Padding(
+    padding: const EdgeInsets.all(6),
+    child: IconButton.filled(
+      tooltip: tooltip,
+      onPressed: onPressed,
+      iconSize: big ? 40 : 28,
+      icon: Icon(icon),
+      style: IconButton.styleFrom(backgroundColor: color ?? Colors.black54, foregroundColor: Colors.white),
+    ),
+  );
+
+  /// Strumento del disegno: arancio se è quello scelto.
+  Widget _toolButton(IconData icon, String tooltip, BrushTool tool) => _roundButton(
+    icon,
+    tooltip,
+    () => setState(() => _tool = tool),
+    color: _tool == tool ? Colors.orange : null,
+  );
+
+  /// Dimensione del pennello: a ogni tocco piccolo → medio → grande → piccolo. Il pallino
+  /// nell'icona è grande quanto il pennello scelto.
+  Widget _brushSizeButton() => Padding(
+    padding: const EdgeInsets.all(6),
+    child: IconButton.filled(
+      tooltip: 'Pennello ${kBrushSizeNames[_brushSize]}',
+      onPressed: () => setState(() => _brushSize = (_brushSize + 1) % kBrushSizesPx.length),
+      icon: SizedBox(
+        width: 28,
+        height: 28,
+        child: Center(child: Icon(Icons.circle, size: 8.0 + 9 * _brushSize)),
+      ),
+      style: IconButton.styleFrom(backgroundColor: Colors.black54, foregroundColor: Colors.white),
+    ),
+  );
+
+  /// I comandi, in colonna o in riga ("Flex" = Row o Column a seconda di [axis]).
+  /// Cambiano con lo stato della zona: proposta → Conferma/Correggi/Ricalibra; analisi ferma →
+  /// Riprova/Disegna a mano; altrimenti i comandi abituali (più occhio e ⚑ in Test).
+  Widget _commands(Axis axis) {
+    final test = widget.settings.isTest;
+    final children = switch (_logic.zoneState) {
+      // Solo icone (le scritte non entravano in verticale); il significato è nel messaggio al
+      // centro e nei tooltip (tenendo premuto il pulsante).
+      ZoneState.proposal => [
+        _roundButton(Icons.check, 'Conferma zona', _onConfirmZone, color: Colors.green, big: true),
+        _roundButton(
+          Icons.close,
+          'Ricalibra',
+          _onRecalibrate,
+          color: Colors.red.withValues(alpha: 0.8),
+          big: true,
+        ),
+        _roundButton(Icons.brush, 'Correggi', _onStartDrawing, big: true),
+        _roundButton(Icons.settings, 'Impostazioni', _openSettings),
+      ],
+      ZoneState.editing => [
+        _toolButton(Icons.gesture, 'Traccia bordo', BrushTool.trace),
+        _toolButton(Icons.brush, 'Aggiungi', BrushTool.add),
+        _toolButton(Icons.auto_fix_normal, 'Cancella', BrushTool.erase),
+        _brushSizeButton(),
+        _roundButton(Icons.check, 'Conferma disegno', _onConfirmDrawing, color: Colors.green, big: true),
+        _roundButton(
+          Icons.close,
+          'Annulla disegno',
+          _onCancelDrawing,
+          color: Colors.red.withValues(alpha: 0.8),
+          big: true,
+        ),
+      ],
+      ZoneState.gaveUp => [
+        _roundButton(Icons.play_arrow, 'Riprova', _resumeAnalysis, color: Colors.green, big: true),
+        _roundButton(Icons.brush, 'Disegna a mano', _onStartDrawing, big: true),
+        _roundButton(Icons.settings, 'Impostazioni', _openSettings),
+      ],
+      _ => [
+        _roundButton(Icons.settings, 'Impostazioni', _openSettings),
+        if (test)
+          _roundButton(
+            _showRaw ? Icons.visibility : Icons.visibility_off,
+            _showRaw ? 'Nascondi rilevamenti grezzi' : 'Mostra rilevamenti grezzi',
+            _toggleRaw,
+          ),
+        _roundButton(Icons.brush, 'Disegna zona', _onStartDrawing),
+        _roundButton(Icons.refresh, 'Ricalibra zona', _onRecalibrate),
+        if (test)
+          _roundButton(
+            Icons.flag,
+            'Segna landing',
+            _onManualPressed,
+            color: Colors.red.withValues(alpha: 0.7),
+          ),
+      ],
+    };
+    return Flex(direction: axis, mainAxisSize: MainAxisSize.min, children: children);
   }
 }

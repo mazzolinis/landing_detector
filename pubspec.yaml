@@ -42,6 +42,8 @@ dependencies:
     path: packages/ultralytics_yolo
   wakelock_plus: ^1.8.2
   sensors_plus: ^7.1.1
+  path_provider: ^2.1.6
+  shared_preferences: ^2.5.6
 
 dev_dependencies:
   flutter_test:

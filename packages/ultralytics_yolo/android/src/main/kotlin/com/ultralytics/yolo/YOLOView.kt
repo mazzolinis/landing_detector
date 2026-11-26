@@ -1417,7 +1417,7 @@ class YOLOView @JvmOverloads constructor(
             fun ms(ns: Long) = "%.1f".format(ns / 1e6 / n)
             val cycle = if (cycleCount == 0) "solo riposo" else
                 (sumCycle / 1e6 / cycleCount).let { "ciclo %.1f ms (%.1f/s)".format(it, 1000 / it) }
-            Log.i("LandingTiming", "$n frame | $cycle | bitmap ${ms(sumBitmap)} | predict ${ms(sumPredict)} | " +
+            if (streamConfig?.timingLogs == true) Log.i("LandingTiming", "$n frame | $cycle | bitmap ${ms(sumBitmap)} | predict ${ms(sumPredict)} | " +
                 "conversione ${ms(sumConvert)} | onFrame ${ms(sumFrame)} | maschere/frame %.1f".format(sumMasks.toDouble() / n))
             timingCount = 0; cycleCount = 0
             sumCycle = 0; sumBitmap = 0; sumPredict = 0; sumConvert = 0; sumFrame = 0; sumMasks = 0

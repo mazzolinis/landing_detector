@@ -565,6 +565,14 @@ void main() {
     expect(summary.flush(window: const Duration(seconds: 2), uptime: Duration.zero), contains('0 frame (0.0/s) | tempi -'));
   });
 
+  test('impostazioni: orientamenti permessi e descrizione', () {
+    expect(const AppSettings().deviceOrientations, hasLength(2)); // orizzontale: due versi
+    expect(const AppSettings(orientation: OrientationChoice.portrait).deviceOrientations, hasLength(1));
+    expect(const AppSettings(orientation: OrientationChoice.auto).deviceOrientations, isEmpty); // = tutti
+    expect(const AppSettings(mode: AppMode.match, fullLog: true).describe(), contains('log nessuno'));
+    expect(const AppSettings(fullLog: true).describe(), contains('log completo'));
+  });
+
   test('stato termico: testo leggibile anche con dati mancanti', () {
     expect(describeThermal({'batteryC': 34.25, 'thermalStatus': 1, 'thermalHeadroom': 0.7}),
         'batteria 34.3 °C, termico 1 (leggero), margine 0.70');
